@@ -10,22 +10,26 @@ export function AlertJournal({alerts,onUpdate,canAcknowledge}:{alerts:Alert[];on
   const [filter,setFilter] = useState('all');
   const [error,setError] = useState('');
   const [busy,setBusy] = useState<number|null>(null);
+  const [optimistic,setOptimistic] = useState<Record<number,number>>({});
+  useEffect(()=>setOptimistic(current=>Object.fromEntries(
+    Object.entries(current).filter(([id])=>!alerts.some(a=>a.id===Number(id)&&a.acknowledged!==null))
+  )),[alerts]);
   const active = alerts.filter(a=>a.resolved===null);
   const visible = alerts.filter(a=>filter==='all'||(filter==='active'?a.resolved===null:a.resolved!==null));
   async function acknowledge(id:number) {
-    setBusy(id);setError('');
+    setBusy(id);setError('');setOptimistic(current=>({...current,[id]:Date.now()/1000}));
     try {const response=await fetch(`/api/alerts/${id}/ack`,{method:'POST'});if(!response.ok)throw new Error('Could not acknowledge this alert. Try again.');onUpdate();}
-    catch(e){setError((e as Error).message);}finally{setBusy(null);}
+    catch(e){setOptimistic(current=>{const next={...current};delete next[id];return next;});setError((e as Error).message);}finally{setBusy(null);}
   }
   return <section className="alert-journal" aria-label="Alert history">
     <div className="section-heading"><h2><Bell size={18}/>Alert history<span>{active.length} active</span></h2><span className="small-label">SAVED ON THIS HOST</span></div>
     <div className="journal-tools"><div className="filter-group">{['all','active','resolved'].map(f=><button key={f} className={filter===f?'active':''} aria-pressed={filter===f} onClick={()=>setFilter(f)}>{f[0].toUpperCase()+f.slice(1)}</button>)}</div><span>Last 7 days · up to 250 incidents</span></div>
     {error&&<p role="alert" className="error">{error}</p>}
-    <div className="incident-list">{visible.map(a=><article key={a.id} className={`incident ${a.resolved===null?'is-active':''}`}>
+    <div className="incident-list">{visible.map(a=>{const acknowledged=a.acknowledged??optimistic[a.id]??null;return <article key={a.id} className={`incident ${a.resolved===null?'is-active':''}`}>
       <div className="incident-icon">{a.resolved!==null?<CheckCircle size={23}/>:<WarningCircle size={23}/>}</div>
-      <div className="incident-body"><div className="incident-heading"><strong>{a.title}</strong><span className={`incident-state ${a.resolved===null?'red':''}`}>{a.resolved!==null?'Recovered':a.acknowledged?'Acknowledged':a.severity}</span></div><p>{a.message}</p><div className="incident-times"><time dateTime={new Date(a.opened*1000).toISOString()}>Opened {date(a.opened)}</time>{a.resolved!==null&&<time>Recovered {date(a.resolved)}</time>}{a.acknowledged!==null&&<span><Check size={12}/> Seen {date(a.acknowledged)}</span>}</div></div>
-      {a.resolved===null&&!a.acknowledged&&canAcknowledge&&<button className="acknowledge" disabled={busy===a.id} onClick={()=>void acknowledge(a.id)} aria-label={`Acknowledge ${a.title}`}><Check size={15}/>{busy===a.id?'Saving…':'Acknowledge'}</button>}
-    </article>)}</div>
+      <div className="incident-body"><div className="incident-heading"><strong>{a.title}</strong><span className={`incident-state ${a.resolved===null?'red':''}`}>{a.resolved!==null?'Recovered':acknowledged?'Acknowledged':a.severity}</span></div><p>{a.message}</p><div className="incident-times"><time dateTime={new Date(a.opened*1000).toISOString()}>Opened {date(a.opened)}</time>{a.resolved!==null&&<time>Recovered {date(a.resolved)}</time>}{acknowledged!==null&&<span><Check size={12}/> Seen {date(acknowledged)}</span>}</div></div>
+      {a.resolved===null&&!acknowledged&&canAcknowledge&&<button className="acknowledge" disabled={busy===a.id} onClick={()=>void acknowledge(a.id)} aria-label={`Acknowledge ${a.title}`}><Check size={15}/>{busy===a.id?'Saving…':'Acknowledge'}</button>}
+    </article>})}</div>
     {visible.length===0&&<div className="journal-empty"><CheckCircle size={30}/><h3>{filter==='resolved'?'No recoveries recorded yet.':filter==='active'?'No active alerts.':'Nothing to report yet.'}</h3><p>Incidents appear after a sustained problem. History begins when monitoring starts.</p></div>}
     <div className="events-footer">ACKNOWLEDGING MARKS AN ALERT AS SEEN. RECOVERY IS DETECTED AUTOMATICALLY.</div>
   </section>;

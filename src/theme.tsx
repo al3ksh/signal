@@ -66,13 +66,16 @@ export function useTheme() {
 
 export function ThemeEditor({ theme, onChange, onClose }: { theme: Theme; onChange: (theme: Theme) => void; onClose: () => void }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const closeTimer = useRef<number | null>(null);
+  const [closing, setClosing] = useState(false);
   const [draft, setDraft] = useState({ background: theme.background, accent: theme.accent });
   const tokens = themeTokens(theme);
-  useEffect(() => { ref.current?.showModal(); }, []);
+  useEffect(() => { ref.current?.showModal(); return () => { if (closeTimer.current !== null) window.clearTimeout(closeTimer.current); }; }, []);
   useEffect(() => setDraft({ background: theme.background, accent: theme.accent }), [theme.background, theme.accent]);
   function update(key: 'background' | 'accent', value: string) { setDraft(v => ({ ...v, [key]: value })); if (hex.test(value)) onChange({ ...theme, name: 'Custom', [key]: value }); }
-  return <dialog className="theme-dialog" ref={ref} onCancel={onClose} aria-labelledby="theme-title" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-    <header><div><Palette size={20} /><h2 id="theme-title">Make it yours.</h2></div><button className="icon-button" onClick={onClose} aria-label="Close theme editor"><X size={21} /></button></header>
+  function requestClose() { if (closing) return; if (document.documentElement.dataset.motion === 'reduced') { onClose(); return; } setClosing(true); closeTimer.current = window.setTimeout(onClose, 220); }
+  return <dialog className={`theme-dialog ${closing ? 'closing' : ''}`} ref={ref} onCancel={e => { e.preventDefault(); requestClose(); }} aria-labelledby="theme-title" onClick={e => { if (e.target === e.currentTarget) requestClose(); }}>
+    <header><div><Palette size={20} /><h2 id="theme-title">Make it yours.</h2></div><button className="icon-button" onClick={requestClose} aria-label="Close theme editor"><X size={21} /></button></header>
     <p className="theme-description">Your console, your atmosphere. Changes preview instantly.</p>
     <div className="theme-preview" aria-label="Live theme preview"><div className="preview-orbit"><i /><i /><i /><span /></div><div><small>PERSONAL FREQUENCY</small><strong>{theme.name}</strong><span><i className="dot" /> All systems in your orbit.</span></div></div>
     <fieldset><legend>START WITH A PRESET</legend><div className="theme-presets">{presets.map(p => <button key={p.name} aria-pressed={theme.name === p.name} onClick={() => onChange({ ...p, motion: theme.motion })} style={{ '--swatch-bg': p.background, '--swatch-accent': p.accent } as React.CSSProperties}><span className="preset-swatch"><i /><i /><i />{theme.name === p.name && <Check size={15} />}</span><span>{p.name}</span></button>)}</div></fieldset>

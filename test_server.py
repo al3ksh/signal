@@ -71,6 +71,23 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(self.request('/api/alerts/1/ack', 'POST').status, 401)
         self.assertEqual(self.request('/api/alerts/1/ack', 'POST', headers={'Origin':'https://evil.example', 'Cookie':'signal_session='+server.make_session()}).status, 403)
 
+    def test_ack_updates_active_snapshot_immediately(self):
+        updated = [{'id': 1, 'acknowledged': 123.0}]
+        class FakeStore:
+            def acknowledge(self, alert_id): return alert_id == 1
+            def alerts(self): return updated
+        previous = self.httpd.monitor
+        self.httpd.monitor = type('Monitor', (), {
+            'lock': threading.Lock(), 'store': FakeStore(),
+            'snapshot': {'containers': [], 'alerts': [{'id': 1, 'acknowledged': None}]}
+        })()
+        try:
+            response = self.request('/api/alerts/1/ack', 'POST', headers={'Cookie':'signal_session='+server.make_session()})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.httpd.monitor.snapshot['alerts'], updated)
+        finally:
+            self.httpd.monitor = previous
+
     def test_monitoring_preference_requires_session_and_updates_snapshot(self):
         path = '/api/containers/abcdef123456/monitoring'
         self.assertEqual(self.request(path, 'POST', {'muted': True}).status, 401)

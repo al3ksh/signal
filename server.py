@@ -314,6 +314,11 @@ class Handler(BaseHTTPRequestHandler):
             if not AUTH or not self.authenticated():
                 return self.json(401, {'error': 'A private session is required.'})
             found = self.server.monitor.store.acknowledge(int(match[1]))
+            if found:
+                alerts = self.server.monitor.store.alerts()
+                with self.server.monitor.lock:
+                    if self.server.monitor.snapshot is not None:
+                        self.server.monitor.snapshot['alerts'] = alerts
             return self.json(200 if found else 404, {'ok': found})
         match = re.fullmatch(r'/api/containers/([a-f0-9]{12})/monitoring', path)
         if match:
@@ -338,6 +343,7 @@ class Handler(BaseHTTPRequestHandler):
             if container.get('ignoreAlerts') and not muted:
                 return self.json(409, {'error': 'Monitoring is disabled by the container label.'})
             self.server.monitor.alert_engine.set_muted(container['name'], muted, time.time())
+            alerts = self.server.monitor.store.alerts()
             with self.server.monitor.lock:
                 snapshot = self.server.monitor.snapshot
                 current = next((c for c in (snapshot or {}).get('containers', []) if c['id'] == match.group(1)), None)
@@ -345,7 +351,7 @@ class Handler(BaseHTTPRequestHandler):
                     current['monitoringMuted'] = muted or current.get('ignoreAlerts', False)
                     current['monitoringMuteSource'] = 'label' if current.get('ignoreAlerts') else ('manual' if muted else None)
                 if snapshot is not None:
-                    snapshot['alerts'] = self.server.monitor.store.alerts()
+                    snapshot['alerts'] = alerts
                 result = {'ok': True, 'name': container['name'], 'monitoringMuted': muted or container.get('ignoreAlerts', False), 'monitoringMuteSource': 'label' if container.get('ignoreAlerts') else ('manual' if muted else None)}
             return self.json(200, result)
         if path != '/api/login' or not AUTH:
