@@ -1,0 +1,35 @@
+{
+  "name": "signal-observatory",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "python -m unittest discover -v"
+  },
+  "dependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@fontsource-variable/space-grotesk": "^5.2.10",
+    "@phosphor-icons/react": "^2.1.10",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.9.2",
+    "vite": "^7.1.0"
+  },
+  "description": "Private Docker and Linux host observatory with persistent history and local alerts.",
+  "homepage": "https://github.com/al3ksh/signal#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/al3ksh/signal.git"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

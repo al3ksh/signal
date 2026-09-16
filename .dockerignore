@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!index.html
+!tsconfig.json
+!vite.config.ts
+!src
+!src/**
+!public
+!public/**
+!server.py
+!storage.py
+!alerts.py
+!setup_access.py

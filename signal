@@ -1,0 +1,56 @@
+#!/bin/sh
+# Portable Linux / Docker Compose launcher. Never sources .env as shell code.
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+command=${1:-start}
+case "$command" in
+  start|update|stop|status|logs|doctor|backup) ;;
+  *) printf 'Usage: sh ./signal {start|update|stop|status|logs|doctor|backup}\n' >&2; exit 2 ;;
+esac
+[ "$(uname -s)" = Linux ] || { echo 'Run SIGNAL on the Linux host you want to monitor.' >&2; exit 1; }
+command -v docker >/dev/null || { echo 'Install Docker Engine and Docker Compose first: https://docs.docker.com/engine/install/' >&2; exit 1; }
+docker compose version >/dev/null
+if [ "$command" = start ] || [ "$command" = update ] || [ "$command" = doctor ]; then
+  docker info >/dev/null
+  if [ ! -f .env ]; then (umask 077; cp .env.example .env); fi
+  socket=${DOCKER_SOCKET:-$(sed -n 's/^DOCKER_SOCKET=//p' .env | tail -1)}
+  socket=${socket:-/var/run/docker.sock}
+  [ -S "$socket" ] || { echo "Docker socket not found at $socket. Set DOCKER_SOCKET in .env." >&2; exit 1; }
+  # Export only the discovered numeric group. Compose reads the remaining settings.
+  DOCKER_GID=$(stat -c '%g' "$socket")
+  export DOCKER_GID
+  env_tmp=$(mktemp .env.XXXXXX)
+  sed "s/^DOCKER_GID=.*/DOCKER_GID=$DOCKER_GID/" .env > "$env_tmp"
+  chmod 600 "$env_tmp"
+  mv "$env_tmp" .env
+fi
+case "$command" in
+  start|update)
+    docker compose build
+    docker compose run --rm --no-deps signal python setup_access.py /data/access.json --if-missing
+    docker compose up -d --wait --wait-timeout 150
+    port=${SIGNAL_PORT:-$(sed -n 's/^SIGNAL_PORT=//p' .env | tail -1)}
+    printf '\nSIGNAL is ready at http://127.0.0.1:%s\n' "${port:-8091}"
+    echo 'Use an SSH tunnel or HTTPS reverse proxy for remote access. See README.md.'
+    ;;
+  stop) docker compose stop ;;
+  status) docker compose ps ;;
+  logs) docker compose logs --tail=100 -f ;;
+  doctor)
+    printf 'Host: %s / %s\nSocket: %s (group %s)\n' "$(uname -s)" "$(uname -m)" "$socket" "$DOCKER_GID"
+    [ -r /proc/stat ] && [ -r /proc/meminfo ] && echo 'Host counters readable.'
+    docker compose config --quiet
+    docker compose ps
+    ;;
+  backup)
+    mkdir -p backups
+    file="backups/signal-$(date -u +%Y%m%d-%H%M%S).tar"
+    # The stopped writer makes the SQLite DB + WAL + access file a consistent set.
+    trap 'docker compose start >/dev/null' EXIT HUP INT TERM
+    docker compose stop signal
+    (umask 077; docker compose run --rm --no-deps -T signal python -c 'import tarfile,sys; t=tarfile.open(fileobj=sys.stdout.buffer,mode="w|"); t.add("/data",arcname="data"); t.close()' > "$file")
+    docker compose start
+    trap - EXIT HUP INT TERM
+    echo "Backup saved to $file. It contains private credentials and telemetry."
+    ;;
+esac

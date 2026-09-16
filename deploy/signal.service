@@ -1,0 +1,29 @@
+[Unit]
+Description=SIGNAL Linux and Docker observatory
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=signal
+Group=signal
+SupplementaryGroups=docker
+WorkingDirectory=/opt/signal
+ExecStart=/usr/bin/python3 /opt/signal/server.py
+Environment=SIGNAL_HOST=127.0.0.1
+Environment=SIGNAL_PORT=8091
+Environment=SIGNAL_DATA_DIR=/var/lib/signal
+StateDirectory=signal
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=40
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/signal
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

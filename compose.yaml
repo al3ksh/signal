@@ -1,0 +1,39 @@
+name: signal
+services:
+  signal:
+    build: .
+    image: signal:local
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    group_add:
+      - "${DOCKER_GID:?Run sh ./signal start to discover the Docker socket group}"
+    environment:
+      SIGNAL_HOST: ${SIGNAL_HOST:-127.0.0.1}
+      SIGNAL_PORT: ${SIGNAL_PORT:-8091}
+      SIGNAL_NODE_NAME: ${SIGNAL_NODE_NAME:-}
+      SIGNAL_INTERVAL: ${SIGNAL_INTERVAL:-5}
+      SIGNAL_TEMP_LIMIT: ${SIGNAL_TEMP_LIMIT:-80}
+      SIGNAL_DATA_DIR: /data
+      SIGNAL_PROC_ROOT: /host/proc
+      SIGNAL_SYS_ROOT: /host/sys
+      SIGNAL_DISK_PATH: /host/root
+      DOCKER_SOCKET: /var/run/docker.sock
+    volumes:
+      - signal-data:/data
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    stop_grace_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  signal-data:
