@@ -35,6 +35,8 @@ services:
 
 Compose one-off jobs are also ignored. For intentional decommissioning, apply the ignore label and allow a sample before removing the service. Label changes require recreating the affected container using its own deployment workflow.
 
+For services that are switched off temporarily, open the container inspector and choose **Mute alerts**. SIGNAL keeps the container and its real Docker state visible, removes it from the needs-attention count, resolves any open incident for that container, and suppresses new incidents until **Unmute alerts** is selected. This preference is stored in SIGNAL's SQLite database and survives restarts. It does not start, stop, or modify the Docker container. A `signal.ignore: "true"` label takes precedence and cannot be unmuted from the dashboard.
+
 One incident stays open for each condition until recovery. A recurrence creates a new incident. Acknowledgement marks an incident as seen by this shared-password account; it does not suppress the condition or resolve it. Resolved incidents are kept for 7 days; active incidents stay until recovery. The panel displays up to 250 incidents.
 
 ## Notification scope

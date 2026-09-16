@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added persistent per-container alert muting from the inspector. Muted containers remain visible with their real Docker state, leave the needs-attention count, and no longer keep incidents active.
+
 ## 2.1.0
 
 - Persistent host telemetry: 1h, 24h and 7d views with explicit coverage and gaps.

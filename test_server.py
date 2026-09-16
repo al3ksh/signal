@@ -71,6 +71,30 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(self.request('/api/alerts/1/ack', 'POST').status, 401)
         self.assertEqual(self.request('/api/alerts/1/ack', 'POST', headers={'Origin':'https://evil.example', 'Cookie':'signal_session='+server.make_session()}).status, 403)
 
+    def test_monitoring_preference_requires_session_and_updates_snapshot(self):
+        path = '/api/containers/abcdef123456/monitoring'
+        self.assertEqual(self.request(path, 'POST', {'muted': True}).status, 401)
+        self.assertEqual(self.request(path, 'POST', {'muted': True}, {'Origin':'https://evil.example', 'Cookie':'signal_session='+server.make_session()}).status, 403)
+
+        class FakeStore:
+            def alerts(self): return []
+        class FakeEngine:
+            def __init__(self): self.calls = []
+            def set_muted(self, name, muted, now): self.calls.append((name, muted))
+        previous = self.httpd.monitor
+        engine = FakeEngine()
+        self.httpd.monitor = type('Monitor', (), {
+            'lock': threading.Lock(), 'store': FakeStore(), 'alert_engine': engine,
+            'snapshot': {'containers':[{'id':'abcdef123456','name':'worker','ignoreAlerts':False}], 'alerts':[]}
+        })()
+        try:
+            response = self.request(path, 'POST', {'muted': True}, {'Cookie':'signal_session='+server.make_session()})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(engine.calls, [('worker', True)])
+            self.assertTrue(self.httpd.monitor.snapshot['containers'][0]['monitoringMuted'])
+        finally:
+            self.httpd.monitor = previous
+
     def test_history_rejects_unbounded_ranges(self):
         response = self.request('/api/history?range=9999d', headers={'Cookie':'signal_session='+server.make_session()})
         self.assertEqual(response.status, 400)

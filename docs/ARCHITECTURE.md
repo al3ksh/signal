@@ -25,6 +25,7 @@ Docker API support is negotiated from `/version`; stats need API 1.41+ (Docker 2
 | GET | `/api/history?range=1h\|24h\|7d` | Bounded persistent telemetry points, bucket step and retention. |
 | GET | `/api/alerts` | Current and recent incidents. |
 | POST | `/api/alerts/{id}/ack` | Marks an incident seen; private session and same-origin request required. |
+| POST | `/api/containers/{id}/monitoring` | Persistently mutes or unmutes SIGNAL incidents for a container; never mutates Docker. |
 | GET | `/api/containers/{id}/details` | Filtered inspect data; no environment variables or host mount sources. |
 | GET | `/api/containers/{id}/logs` | Last 160 lines, bounded response; private sessions only. |
 

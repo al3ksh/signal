@@ -120,6 +120,31 @@ class AlertTests(HistoryTests):
         restarted.evaluate(self.sample(55))
         self.assertIsNotNone(self.store.alerts()[0]['resolved'])
 
+    def test_manual_mute_resolves_and_persists(self):
+        engine = AlertEngine(self.store)
+        engine.evaluate(self.sample(0))
+        engine.evaluate(self.sample(5, 'exited'))
+        engine.evaluate(self.sample(26, 'exited'))
+        self.assertIsNone(self.store.alerts()[0]['resolved'])
+
+        engine.set_muted('web', True, self.now+27)
+        self.assertEqual(self.store.alerts()[0]['resolved'], self.now+27)
+        muted = self.sample(30, 'exited')
+        engine.evaluate(muted)
+        self.assertTrue(muted['containers'][0]['monitoringMuted'])
+        self.assertEqual(muted['containers'][0]['monitoringMuteSource'], 'manual')
+
+        restarted = AlertEngine(self.store)
+        still_muted = self.sample(40, 'exited')
+        restarted.evaluate(still_muted)
+        self.assertTrue(still_muted['containers'][0]['monitoringMuted'])
+        self.assertEqual(len(self.store.alerts()), 1)
+
+        restarted.set_muted('web', False, self.now+41)
+        restarted.evaluate(self.sample(42, 'exited'))
+        restarted.evaluate(self.sample(63, 'exited'))
+        self.assertEqual(len(self.store.alerts()), 2)
+
 
 if __name__ == '__main__':
     unittest.main()

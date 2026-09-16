@@ -315,6 +315,39 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(401, {'error': 'A private session is required.'})
             found = self.server.monitor.store.acknowledge(int(match[1]))
             return self.json(200 if found else 404, {'ok': found})
+        match = re.fullmatch(r'/api/containers/([a-f0-9]{12})/monitoring', path)
+        if match:
+            if not AUTH or not self.authenticated():
+                return self.json(401, {'error': 'A private session is required.'})
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if length < 1 or length > 4096:
+                    return self.json(400, {'error': 'Invalid request.'})
+                body = json.loads(self.rfile.read(length))
+                muted = body.get('muted')
+                if not isinstance(muted, bool):
+                    return self.json(400, {'error': 'muted must be a boolean.'})
+            except (ValueError, json.JSONDecodeError):
+                return self.json(400, {'error': 'Invalid request.'})
+            with self.server.monitor.lock:
+                snapshot = self.server.monitor.snapshot
+                current = next((c for c in (snapshot or {}).get('containers', []) if c['id'] == match.group(1)), None)
+                container = dict(current) if current else None
+            if not container:
+                return self.json(404, {'error': 'Container is no longer available.'})
+            if container.get('ignoreAlerts') and not muted:
+                return self.json(409, {'error': 'Monitoring is disabled by the container label.'})
+            self.server.monitor.alert_engine.set_muted(container['name'], muted, time.time())
+            with self.server.monitor.lock:
+                snapshot = self.server.monitor.snapshot
+                current = next((c for c in (snapshot or {}).get('containers', []) if c['id'] == match.group(1)), None)
+                if current:
+                    current['monitoringMuted'] = muted or current.get('ignoreAlerts', False)
+                    current['monitoringMuteSource'] = 'label' if current.get('ignoreAlerts') else ('manual' if muted else None)
+                if snapshot is not None:
+                    snapshot['alerts'] = self.server.monitor.store.alerts()
+                result = {'ok': True, 'name': container['name'], 'monitoringMuted': muted or container.get('ignoreAlerts', False), 'monitoringMuteSource': 'label' if container.get('ignoreAlerts') else ('manual' if muted else None)}
+            return self.json(200, result)
         if path != '/api/login' or not AUTH:
             return self.json(404, {'error': 'Unknown endpoint.'})
         address = self.headers.get('CF-Connecting-IP', self.client_address[0]) if self.client_address[0] in ('127.0.0.1', '::1') else self.client_address[0]
