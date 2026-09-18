@@ -36,7 +36,7 @@ button:active:not(:disabled){transform:translateY(1px) scale(.97);transition-dur
 @keyframes title-shift{from{opacity:.45;transform:translateY(5px);filter:blur(2px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 @keyframes readout-in{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:translateY(0)}}
 @keyframes drawer-enter{from{transform:translateX(50px);opacity:.4}to{transform:translateX(0);opacity:1}}
-@keyframes backdrop-enter{from{background:#050a0700;backdrop-filter:blur(0)}to{background:#050a07aa;backdrop-filter:blur(3px)}}
+@keyframes backdrop-enter{from{background:#00000000;backdrop-filter:blur(0)}to{background:#000000aa;backdrop-filter:blur(3px)}}
 @keyframes settings-enter{from{opacity:.3;transform:translateY(-5px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes theme-dialog-out{to{opacity:0;transform:translateY(-4px) scale(.985)}}
 @keyframes theme-backdrop-out{to{background:#0000;backdrop-filter:blur(0)}}
