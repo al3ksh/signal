@@ -30,7 +30,10 @@ Open `http://localhost:8091` on that computer. For a domain, point an HTTPS reve
 - Host CPU cores, RAM, root filesystem usage, load, network throughput and top visible processes. Temperature is optional; unsupported hardware shows an unavailable state.
 - Live charts plus **1 hour / 24 hours / 7 days** of saved host telemetry. History accumulates from installation; it cannot reconstruct earlier measurements.
 - Persistent alerts for stopped, missing or unhealthy watched containers, Docker outages, high temperature, sustained CPU/RAM pressure and disk capacity.
-- An interactive orbit/matrix, filtering, pinning, chart inspection, log filtering/following, keyboard controls, custom themes and reduced motion.
+- Service cards group Compose projects, aggregate their resource use and combine container state with opt-in HTTP endpoint checks.
+- Maintenance windows suppress expected service incidents for an hour, a day, a custom end time or until manually resumed.
+- A daily system brief, incident markers over saved telemetry and a global `Ctrl+K` command palette shorten routine diagnosis.
+- An interactive orbit/matrix, filtering, pinning, chart inspection, log filtering/following, custom themes and reduced motion.
 - One password, a 30-day session per device, no external telemetry service, and self-hosted fonts.
 
 ## Everyday commands
@@ -60,4 +63,4 @@ This is a **single-host Linux monitor**. It does not monitor Windows/macOS hosts
 
 ## Repository status
 
-Version 2.1.0. CI builds the frontend and container and runs backend tests. Secrets, private deployment files, runtime databases, backups and generated builds are excluded from source control. A distribution license has not been selected; choose one before publishing this as an open-source project. Third-party packages retain their own licenses.
+Version 2.2.0. CI builds the frontend and container and runs backend tests. Secrets, private deployment files, runtime databases, backups and generated builds are excluded from source control. A distribution license has not been selected; choose one before publishing this as an open-source project. Third-party packages retain their own licenses.

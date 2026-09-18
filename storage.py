@@ -92,6 +92,33 @@ class Store:
         with self.lock:
             return [dict(r) for r in self.db.execute('SELECT * FROM alerts ORDER BY resolved IS NULL DESC, opened DESC LIMIT 250')]
 
+    def daily_brief(self, now=None):
+        now = time.time() if now is None else now
+        since = now - 86400
+        history = self.history(86400, now)['points']
+        with self.lock:
+            incidents = [dict(r) for r in self.db.execute(
+                'SELECT * FROM alerts WHERE opened >= ? ORDER BY opened', (since,))]
+        values = lambda field: [p[field] for p in history if p.get(field) is not None]
+        cpu, temperatures = values('cpu'), values('temperature')
+        intervals = sorted((max(since, a['opened']), min(now, a['resolved'] or now)) for a in incidents
+                           if a['severity'] == 'critical' and (a['key'] == 'docker' or a['key'].startswith(('container:', 'http:'))))
+        merged = []
+        for start, end in intervals:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        downtime = sum(end-start for start, end in merged)
+        return {
+            'since': since, 'until': now, 'samples': len(history),
+            'coverage': min(100, len(history) / 1440 * 100),
+            'observedUptime': max(0, (86400-downtime) / 86400 * 100),
+            'incidents': len(incidents), 'recoveries': sum(a['resolved'] is not None for a in incidents),
+            'averageCpu': sum(cpu)/len(cpu) if cpu else None,
+            'peakTemperature': max(temperatures) if temperatures else None,
+        }
+
     def open_alert(self, key, severity, title, message, now):
         with self.lock, self.db:
             self.db.execute('INSERT OR IGNORE INTO alerts(key,severity,title,message,opened) VALUES (?,?,?,?,?)', (key,severity,title,message,now))

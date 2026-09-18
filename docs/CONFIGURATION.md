@@ -25,6 +25,24 @@ Native-only/path settings (fixed to container mount paths in the supplied Compos
 
 The first usable CPU thermal-zone readings supply temperature (the highest plausible zone value is used). Hardware throttling uses `vcgencmd` if installed in a native Raspberry Pi environment. The supplied container has no `vcgencmd`; absence is displayed honestly.
 
+## Services and HTTP checks
+
+SIGNAL groups containers by the Docker Compose project label. Standalone containers appear together under `standalone`. Open **Services** to inspect a group, pause its alerts during maintenance, or add an HTTP/HTTPS endpoint check. Checks run from the monitored server every 15 seconds with a three-second timeout. They follow redirects, record status and latency, and open an incident after 30 seconds of sustained failure.
+
+Endpoint checks are stored in SIGNAL's private SQLite volume. URLs may target a public domain or a local health endpoint reachable from the host. Embedded URL credentials are rejected; use a dedicated unauthenticated health route that reveals no private data.
+
+A check can also travel with a Compose service:
+
+```yaml
+services:
+  web:
+    image: example/web
+    labels:
+      signal.check.url: "http://127.0.0.1:3000/health"
+```
+
+Label-defined checks are read-only in the dashboard and disappear when the container disappears. UI-defined checks remain until removed.
+
 ## HTTPS reverse proxy
 
 Forward to `http://127.0.0.1:8091`. Preserve the original `Host` and set `X-Forwarded-Proto: https`. SIGNAL uses this header to set Secure cookies. Keep the origin server reachable only by the proxy. Cookies are HttpOnly and SameSite=Strict; sessions last 30 days. Request bodies and access logs should never record passwords.

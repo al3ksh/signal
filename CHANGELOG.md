@@ -2,7 +2,12 @@
 
 ## Unreleased
 
+## 2.2.0 — 2026-09-18
+
 - Added persistent per-container alert muting from the inspector. Muted containers remain visible with their real Docker state, leave the needs-attention count, and no longer keep incidents active.
+- Added Compose-project service cards with aggregate health and resource summaries.
+- Added persistent service maintenance windows and opt-in HTTP endpoint monitoring.
+- Added a 24-hour system brief, incident markers on telemetry charts and a global command palette.
 
 ## 2.1.0
 

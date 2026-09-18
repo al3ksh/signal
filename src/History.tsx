@@ -36,10 +36,11 @@ export function AlertJournal({alerts,onAcknowledge,canAcknowledge}:{alerts:Alert
   </section>;
 }
 
-export function HistoryExplorer({timestamp,paused}:{timestamp:number;paused:boolean}) {
+export function HistoryExplorer({timestamp,paused,alerts}:{timestamp:number;paused:boolean;alerts:Alert[]}) {
   const [range,setRange]=useState('24h');
   const [result,setResult]=useState<{points:Point[];step:number}|null>(null);
   const [busy,setBusy]=useState(false),[error,setError]=useState(''),[revision,setRevision]=useState(0);
+  const [selectedAlert,setSelectedAlert]=useState<number|null>(null);
   const frozen=useRef(timestamp);
   if(!paused)frozen.current=timestamp;
   const tick=Math.floor(frozen.current/30);
@@ -49,14 +50,18 @@ export function HistoryExplorer({timestamp,paused}:{timestamp:number;paused:bool
     return()=>controller.abort();
   },[range,tick,revision]);
   const points=result?.points||[];
+  const seconds=range==='1h'?3600:range==='24h'?86400:604800;
+  const timeline=alerts.filter(alert=>alert.opened>=timestamp-seconds).sort((a,b)=>a.opened-b.opened);
+  const selected=timeline.find(alert=>alert.id===selectedAlert)||null;
   return <section className="history-explorer" aria-label="Persistent telemetry history">
     <div className="section-heading"><h2><ChartLine size={19}/>Telemetry archive</h2><div className="history-actions"><div className="range-control" aria-label="Archive range">{[['1h','1 hour'],['24h','24 hours'],['7d','7 days']].map(([id,label])=><button key={id} aria-pressed={range===id} className={range===id?'active':''} onClick={()=>{setResult(null);setRange(id);}}>{label}</button>)}</div><button className="icon-button" disabled={busy} aria-label="Refresh history" onClick={()=>setRevision(v=>v+1)}><ArrowClockwise className={busy?'spin':''}/></button></div></div>
+    <div className="incident-timeline"><div className="timeline-label"><span>INCIDENT TIMELINE</span><span>{timeline.length} in range</span></div><div className="timeline-track">{timeline.map(alert=><button key={alert.id} className={`${alert.resolved===null?'active':''} ${selectedAlert===alert.id?'selected':''}`} style={{left:`${Math.max(0,Math.min(100,(alert.opened-(timestamp-seconds))/seconds*100))}%`}} aria-label={`${alert.title}, ${date(alert.opened)}`} onClick={()=>setSelectedAlert(id=>id===alert.id?null:alert.id)}/>)}</div>{selected&&<div className="timeline-readout"><strong>{selected.title}</strong><span>{date(selected.opened)} · {selected.resolved?`Recovered ${date(selected.resolved)}`:'Still active'}</span><p>{selected.message}</p></div>}</div>
     <div className="history-coverage" role="status">{error?<span className="red">{error}</span>:busy&&!result?'Reading saved telemetry…':points.length?`${date(points[0].time)} → ${date(points[points.length-1].time)} · ${result!.step/60} minute averages`:'History starts with the first sample. No earlier data is available.'}<span>7 DAY RETENTION</span></div>
     <div className="archive-charts">{([{field:'cpu',label:'CPU usage',unit:'%',max:100},{field:'memory',label:'Memory usage',unit:'%',max:100},{field:'temperature',label:'Temperature',unit:'°C',max:100},{field:'rx',label:'Download',unit:'B/s'},{field:'tx',label:'Upload',unit:'B/s'}] as const).map(item=>{
       const values=points.map(p=>p[item.field]).filter((v):v is number=>v!==null);
       const avg=values.length?values.reduce((a,b)=>a+b,0)/values.length:null;
       const readable=avg===null?'Unavailable':item.unit==='B/s'?`${(avg/1024).toFixed(1)} KiB/s`:`${avg.toFixed(1)} ${item.unit}`;
-      return <article className="archive-chart" key={item.field}><header><h3>{item.label}</h3><span>{readable}<small> / average</small></span></header><Chart points={points} field={item.field} max={'max' in item?item.max:undefined} height={132} label={`${item.label}, ${range} history`}/></article>;
+      return <article className="archive-chart" key={item.field}><header><h3>{item.label}</h3><span>{readable}<small> / average</small></span></header><Chart points={points} field={item.field} max={'max' in item?item.max:undefined} height={132} label={`${item.label}, ${range} history`} markerTime={selected?.opened}/></article>;
     })}</div><div className="events-footer">GAPS MEAN MISSING SAMPLES. VALUES ARE AVERAGES, SO SHORT PEAKS MAY BE SMOOTHED.</div>
   </section>;
 }

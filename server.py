@@ -16,12 +16,15 @@ import subprocess
 import threading
 import time
 import signal
+import uuid
 from storage import Store
 from alerts import AlertEngine
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, parse_qs, unquote
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 INTERVAL = max(3, int(os.getenv('SIGNAL_INTERVAL', '5')))
@@ -152,7 +155,67 @@ class Monitor:
         self.process_ticks = {}
         self.container_ticks = {}
         self.previous_states = {}
+        self.http_checks = self.store.metadata('httpChecks', [])
+        self.check_results = {}
+        self.last_check_time = 0
         self.boot_at = time.time()
+
+    @staticmethod
+    def http_check(check, now):
+        started = time.monotonic()
+        result = dict(check)
+        try:
+            request = Request(check['url'], headers={'User-Agent': 'SIGNAL/2.1'}, method='GET')
+            with urlopen(request, timeout=3) as response:
+                status = response.status
+            result.update(ok=200 <= status < 400, status=status, error=None)
+        except HTTPError as exc:
+            result.update(ok=False, status=exc.code, error='HTTP '+str(exc.code))
+        except (URLError, OSError, ValueError) as exc:
+            reason = getattr(exc, 'reason', exc)
+            result.update(ok=False, status=None, error=str(reason)[:160])
+        result['latency'] = round((time.monotonic()-started)*1000, 1)
+        result['checkedAt'] = now
+        result['message'] = ('HTTP '+str(result['status'])) if result.get('status') else (result.get('error') or 'Connection failed')
+        return result
+
+    def configured_checks(self, containers):
+        with self.lock:
+            checks = list(self.http_checks)
+        known = {item['url'] for item in checks}
+        for container in containers:
+            url = container.get('checkUrl')
+            if url and url not in known:
+                checks.append({'id': 'label-'+hashlib.sha1((container['name']+url).encode()).hexdigest()[:12],
+                               'service': container.get('project', 'standalone'), 'name': container['name'], 'url': url, 'source': 'label'})
+                known.add(url)
+        return checks
+
+    def update_check(self, body):
+        action = body.get('action', 'upsert')
+        check_id = str(body.get('id') or uuid.uuid4().hex[:12])
+        removed = False
+        with self.lock:
+            if action == 'delete':
+                removed = any(item['id'] == check_id for item in self.http_checks)
+                self.http_checks = [item for item in self.http_checks if item['id'] != check_id]
+            else:
+                url = str(body.get('url', '')).strip()
+                parsed = urlparse(url)
+                if len(url) > 2048 or parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
+                    raise ValueError('Enter a valid HTTP or HTTPS URL without embedded credentials.')
+                service = str(body.get('service', '')).strip()[:100]
+                name = str(body.get('name', '')).strip()[:100]
+                if not service or not name:
+                    raise ValueError('Service and check name are required.')
+                item = {'id': check_id, 'service': service, 'name': name, 'url': url, 'source': 'manual'}
+                self.http_checks = [current for current in self.http_checks if current['id'] != check_id] + [item]
+            self.store.set_metadata('httpChecks', self.http_checks)
+            self.last_check_time = 0
+            checks = list(self.http_checks)
+        if removed:
+            self.alert_engine.clear_condition('http:'+check_id, time.time())
+        return checks
 
     def process_sample(self, elapsed):
         ticks, processes = {}, []
@@ -181,6 +244,7 @@ class Monitor:
         result = {'id': cid[:12], 'name': item['Names'][0].lstrip('/'), 'image': item['Image'], 'state': item['State'], 'status': item['Status'], 'created': item['Created'], 'project': item.get('Labels', {}).get('com.docker.compose.project', 'standalone'), 'service': item.get('Labels', {}).get('com.docker.compose.service', ''), 'ports': [{'private': p['PrivatePort'], 'public': p.get('PublicPort'), 'ip': p.get('IP', ''), 'protocol': p['Type']} for p in item.get('Ports', [])], 'cpu': None, 'memory': None, 'memoryLimit': None, 'networkRx': None, 'networkTx': None, 'health': None}
         labels = item.get('Labels', {})
         result['ignoreAlerts'] = labels.get('signal.ignore', '').lower() == 'true' or labels.get('com.docker.compose.oneoff', '').lower() == 'true'
+        result['checkUrl'] = labels.get('signal.check.url') or None
         if '(unhealthy)' in result['status']:
             result['health'] = 'unhealthy'
         elif '(healthy)' in result['status']:
@@ -250,7 +314,16 @@ class Monitor:
             throttle = int(raw_throttle.split('=')[1], 16)
         except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
             pass
-        data = {'timestamp': now, 'interval': INTERVAL, 'host': {'name': os.getenv('SIGNAL_NODE_NAME') or read('/proc/sys/kernel/hostname', socket.gethostname()), 'alias': os.getenv('SIGNAL_NODE_NAME') or read('/proc/sys/kernel/hostname', socket.gethostname()), 'model': read('/proc/device-tree/model').replace('\0', '') or read('/sys/class/dmi/id/product_name', 'Linux host'), 'kernel': os.uname().release, 'arch': os.uname().machine, 'uptime': float(read('/proc/uptime', '0').split()[0]), 'cpu': usage[0] if usage else 0, 'cores': usage[1:], 'frequency': int(freq)/1000 if freq else None, 'load': os.getloadavg(), 'temperature': temp, 'throttle': throttle, 'memory': {'total': memory['MemTotal'], 'used': memory['MemTotal']-memory['MemAvailable'], 'available': memory['MemAvailable'], 'cache': memory.get('Cached', 0), 'swapTotal': memory.get('SwapTotal', 0), 'swapUsed': memory.get('SwapTotal', 0)-memory.get('SwapFree', 0)}, 'disk': {'total': disk.total, 'used': disk.used, 'free': disk.free}, 'network': interfaces}, 'containers': sorted(containers, key=lambda c: (c['state'] == 'running' and c['health'] != 'unhealthy', c['name'])), 'dockerVersion': docker_version, 'processes': self.process_sample(elapsed), 'errors': errors, 'startedAt': self.boot_at}
+        configured_checks = self.configured_checks(containers)
+        if configured_checks and (not self.check_results or now-self.last_check_time >= 15):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                checked = list(pool.map(lambda item: self.http_check(item, now), configured_checks))
+            self.check_results = {item['id']: item for item in checked}
+            self.last_check_time = now
+        check_ids = {item['id'] for item in configured_checks}
+        self.check_results = {key: value for key, value in self.check_results.items() if key in check_ids}
+        checks = [self.check_results.get(item['id'], {**item, 'ok': None, 'status': None, 'latency': None, 'checkedAt': None, 'message': 'Waiting for the first check'}) for item in configured_checks]
+        data = {'timestamp': now, 'interval': INTERVAL, 'host': {'name': os.getenv('SIGNAL_NODE_NAME') or read('/proc/sys/kernel/hostname', socket.gethostname()), 'alias': os.getenv('SIGNAL_NODE_NAME') or read('/proc/sys/kernel/hostname', socket.gethostname()), 'model': read('/proc/device-tree/model').replace('\0', '') or read('/sys/class/dmi/id/product_name', 'Linux host'), 'kernel': os.uname().release, 'arch': os.uname().machine, 'uptime': float(read('/proc/uptime', '0').split()[0]), 'cpu': usage[0] if usage else 0, 'cores': usage[1:], 'frequency': int(freq)/1000 if freq else None, 'load': os.getloadavg(), 'temperature': temp, 'throttle': throttle, 'memory': {'total': memory['MemTotal'], 'used': memory['MemTotal']-memory['MemAvailable'], 'available': memory['MemAvailable'], 'cache': memory.get('Cached', 0), 'swapTotal': memory.get('SwapTotal', 0), 'swapUsed': memory.get('SwapTotal', 0)-memory.get('SwapFree', 0)}, 'disk': {'total': disk.total, 'used': disk.used, 'free': disk.free}, 'network': interfaces}, 'containers': sorted(containers, key=lambda c: (c['state'] == 'running' and c['health'] != 'unhealthy', c['name'])), 'checks': checks, 'dockerVersion': docker_version, 'processes': self.process_sample(elapsed), 'errors': errors, 'startedAt': self.boot_at}
         point = {'time': now, 'cpu': data['host']['cpu'], 'memory': data['host']['memory']['used']/memory['MemTotal']*100, 'temperature': data['host']['temperature'], 'rx': sum(i['rx'] for i in interfaces), 'tx': sum(i['tx'] for i in interfaces)}
         self.store.add(point)
         self.alert_engine.evaluate(data)
@@ -301,6 +374,15 @@ class Handler(BaseHTTPRequestHandler):
         secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
         self.cookie_header = 'signal_session=' + token + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + str(age) + secure
 
+    def request_json(self):
+        length = int(self.headers.get('Content-Length', '0'))
+        if length < 1 or length > 8192:
+            raise ValueError('Invalid request.')
+        value = json.loads(self.rfile.read(length))
+        if not isinstance(value, dict):
+            raise ValueError('Invalid request.')
+        return value
+
     def do_POST(self):
         path = urlparse(self.path).path
         origin = self.headers.get('Origin')
@@ -343,16 +425,58 @@ class Handler(BaseHTTPRequestHandler):
             if container.get('ignoreAlerts') and not muted:
                 return self.json(409, {'error': 'Monitoring is disabled by the container label.'})
             self.server.monitor.alert_engine.set_muted(container['name'], muted, time.time())
+            with self.server.monitor.lock:
+                snapshot = self.server.monitor.snapshot
+            if snapshot is not None:
+                self.server.monitor.alert_engine.decorate(snapshot)
             alerts = self.server.monitor.store.alerts()
             with self.server.monitor.lock:
                 snapshot = self.server.monitor.snapshot
                 current = next((c for c in (snapshot or {}).get('containers', []) if c['id'] == match.group(1)), None)
-                if current:
-                    current['monitoringMuted'] = muted or current.get('ignoreAlerts', False)
-                    current['monitoringMuteSource'] = 'label' if current.get('ignoreAlerts') else ('manual' if muted else None)
                 if snapshot is not None:
                     snapshot['alerts'] = alerts
-                result = {'ok': True, 'name': container['name'], 'monitoringMuted': muted or container.get('ignoreAlerts', False), 'monitoringMuteSource': 'label' if container.get('ignoreAlerts') else ('manual' if muted else None), 'alerts': alerts}
+                result = {'ok': True, 'name': container['name'], 'monitoringMuted': current.get('monitoringMuted', muted) if current else muted, 'monitoringMuteSource': current.get('monitoringMuteSource') if current else ('manual' if muted else None), 'alerts': alerts}
+            return self.json(200, result)
+        if path == '/api/checks':
+            if not AUTH or not self.authenticated():
+                return self.json(401, {'error': 'A private session is required.'})
+            try:
+                body = self.request_json()
+                checks = self.server.monitor.update_check(body)
+                return self.json(200, {'ok': True, 'checks': checks, 'alerts': self.server.monitor.store.alerts()})
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self.json(400, {'error': str(exc) or 'Invalid request.'})
+        if path == '/api/maintenance':
+            if not AUTH or not self.authenticated():
+                return self.json(401, {'error': 'A private session is required.'})
+            try:
+                body = self.request_json()
+                service = str(body.get('service', '')).strip()[:100]
+                until = body.get('until')
+                if not service or (until is not None and not isinstance(until, (int, float))):
+                    raise ValueError('Service and a valid maintenance end are required.')
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self.json(400, {'error': str(exc) or 'Invalid request.'})
+            now = time.time()
+            with self.server.monitor.lock:
+                snapshot = self.server.monitor.snapshot
+                containers = list((snapshot or {}).get('containers', []))
+                checks = list((snapshot or {}).get('checks', []))
+            known = {c.get('project', 'standalone') for c in containers} | {c.get('service', 'standalone') for c in checks}
+            if service not in known:
+                return self.json(404, {'error': 'Service is no longer available.'})
+            self.server.monitor.alert_engine.set_maintenance(service, until, containers, checks, now)
+            alerts = self.server.monitor.store.alerts()
+            with self.server.monitor.lock:
+                snapshot = self.server.monitor.snapshot
+            if snapshot is not None:
+                snapshot['timestamp'] = max(snapshot['timestamp'], now)
+                self.server.monitor.alert_engine.decorate(snapshot)
+                with self.server.monitor.lock:
+                    snapshot['alerts'] = alerts
+                    result = {'ok': True, 'maintenance': snapshot['maintenance'], 'containers': snapshot['containers'], 'checks': snapshot.get('checks', []), 'alerts': alerts}
+            else:
+                result = {'ok': True, 'maintenance': self.server.monitor.alert_engine.active_maintenance(now), 'containers': [], 'checks': [], 'alerts': alerts}
             return self.json(200, result)
         if path != '/api/login' or not AUTH:
             return self.json(404, {'error': 'Unknown endpoint.'})
@@ -403,6 +527,8 @@ class Handler(BaseHTTPRequestHandler):
             if value not in ranges:
                 return self.json(400, {'error': 'Use range=1h, 24h or 7d.'})
             return self.json(200, self.server.monitor.store.history(ranges[value]))
+        if path == '/api/brief':
+            return self.json(200, self.server.monitor.store.daily_brief())
         if path == '/api/alerts':
             return self.json(200, {'alerts': self.server.monitor.store.alerts()})
         if path == '/api/status':

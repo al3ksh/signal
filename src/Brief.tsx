@@ -1,0 +1,10 @@
+import { useEffect, useState } from 'react';
+import { Pulse as Activity, ArrowClockwise, CheckCircle, Gauge, Thermometer } from '@phosphor-icons/react';
+
+type Brief={since:number;until:number;samples:number;coverage:number;observedUptime:number;incidents:number;recoveries:number;averageCpu:number|null;peakTemperature:number|null};
+const value=(number:number|null,digits=1)=>number===null?'···':number.toFixed(digits);
+export function DailyBrief(){
+  const [brief,setBrief]=useState<Brief|null>(null),[error,setError]=useState(''),[revision,setRevision]=useState(0);
+  useEffect(()=>{const controller=new AbortController();fetch('/api/brief',{signal:controller.signal}).then(async response=>{const result=await response.json();if(!response.ok)throw new Error(result.error||'Daily brief unavailable.');return result;}).then(setBrief).catch(e=>{if(e.name!=='AbortError')setError(e.message);});return()=>controller.abort();},[revision]);
+  return <section className="daily-brief"><header><div><span className="small-label">LAST 24 HOURS</span><h2>Daily system brief</h2></div><button className="icon-button" aria-label="Refresh daily brief" onClick={()=>setRevision(v=>v+1)}><ArrowClockwise size={15}/></button></header>{error?<p className="error">{error}</p>:<div className="brief-grid"><article><CheckCircle/><span>OBSERVED UPTIME</span><strong>{brief?value(brief.observedUptime,2):'···'}<small>%</small></strong><p>Across Docker, containers and HTTP checks</p></article><article><Activity/><span>INCIDENTS</span><strong>{brief?.incidents??'···'}</strong><p>{brief?.recoveries??'···'} recovered in this window</p></article><article><Thermometer/><span>PEAK TEMPERATURE</span><strong>{brief?value(brief.peakTemperature):'···'}<small>°C</small></strong><p>Highest saved minute average</p></article><article><Gauge/><span>AVERAGE CPU</span><strong>{brief?value(brief.averageCpu):'···'}<small>%</small></strong><p>{brief?`${value(brief.coverage,0)}% telemetry coverage`:'Reading saved telemetry'}</p></article></div>}</section>;
+}

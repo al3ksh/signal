@@ -23,10 +23,13 @@ Docker API support is negotiated from `/version`; stats need API 1.41+ (Docker 2
 | POST | `/api/logout` | Clears this device's cookie. |
 | GET | `/api/status` | Current host, containers, live history, process list, events and alerts. |
 | GET | `/api/history?range=1h\|24h\|7d` | Bounded persistent telemetry points, bucket step and retention. |
+| GET | `/api/brief` | Aggregated 24-hour coverage, incident, uptime, CPU and temperature summary. |
 | GET | `/api/alerts` | Current and recent incidents. |
 | POST | `/api/alerts/{id}/ack` | Marks an incident seen; private session and same-origin request required. |
 | POST | `/api/containers/{id}/monitoring` | Persistently mutes or unmutes SIGNAL incidents for a container; never mutates Docker. |
+| POST | `/api/maintenance` | Starts, changes or ends a service maintenance window. |
+| POST | `/api/checks` | Adds, updates or removes a persisted HTTP endpoint check. |
 | GET | `/api/containers/{id}/details` | Filtered inspect data; no environment variables or host mount sources. |
 | GET | `/api/containers/{id}/logs` | Last 160 lines, bounded response; private sessions only. |
 
-All telemetry endpoints require authentication by default. Container identifiers must be a known 12-character ID from the snapshot. There are no start, stop, restart, exec or arbitrary Docker proxy routes. The API is internal and may evolve; it is not versioned as a public integration contract.
+All telemetry endpoints require authentication by default. Mutations require the private password session and reject cross-origin requests. Container identifiers must be a known 12-character ID from the snapshot. There are no start, stop, restart, exec or arbitrary Docker proxy routes. The API is internal and may evolve; it is not versioned as a public integration contract.

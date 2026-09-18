@@ -57,7 +57,7 @@ class HistoryTests(unittest.TestCase):
 class AlertTests(HistoryTests):
     def sample(self, offset, state='running', health='healthy', temp=40, errors=None, ignored=False, present=True):
         return dict(timestamp=self.now+offset, errors=errors or [],
-                    containers=[dict(name='web',state=state,health=health,ignoreAlerts=ignored)] if present else [],
+                    containers=[dict(name='web',project='stack',state=state,health=health,ignoreAlerts=ignored)] if present else [], checks=[],
                     host=dict(cpu=20,temperature=temp,memory=dict(used=30,total=100),disk=dict(used=40,total=100)))
 
     def test_container_debounce_recovery_and_recurrence(self):
@@ -144,6 +144,46 @@ class AlertTests(HistoryTests):
         restarted.evaluate(self.sample(42, 'exited'))
         restarted.evaluate(self.sample(63, 'exited'))
         self.assertEqual(len(self.store.alerts()), 2)
+
+    def test_maintenance_suppresses_service_then_expires(self):
+        engine = AlertEngine(self.store)
+        running = self.sample(0)
+        engine.evaluate(running)
+        engine.set_maintenance('stack', self.now+40, running['containers'], [], self.now+1)
+        stopped = self.sample(25, 'exited')
+        engine.evaluate(stopped)
+        self.assertEqual(stopped['containers'][0]['monitoringMuteSource'], 'maintenance')
+        self.assertFalse(self.store.alerts())
+        engine.evaluate(self.sample(41, 'exited'))
+        engine.evaluate(self.sample(62, 'exited'))
+        self.assertEqual(self.store.alerts()[0]['key'], 'container:web')
+
+    def test_http_check_incident_respects_maintenance(self):
+        engine = AlertEngine(self.store)
+        sample = self.sample(0)
+        sample['checks'] = [dict(id='home', service='stack', name='Homepage', ok=False, message='HTTP 503')]
+        engine.set_maintenance('stack', self.now+35, sample['containers'], sample['checks'], self.now)
+        engine.evaluate(sample)
+        later = self.sample(40)
+        later['checks'] = [dict(id='home', service='stack', name='Homepage', ok=False, message='HTTP 503')]
+        engine.evaluate(later)
+        later['timestamp'] = self.now+71
+        engine.evaluate(later)
+        self.assertEqual(self.store.alerts()[0]['key'], 'http:home')
+        engine.clear_condition('http:home', self.now+72)
+        self.assertEqual(self.store.alerts()[0]['resolved'], self.now+72)
+
+    def test_daily_brief_merges_overlapping_critical_incidents(self):
+        self.add(self.now-60, 20, 50)
+        self.store.open_alert('container:web', 'critical', 'Web down', 'Stopped', self.now-120)
+        self.store.open_alert('http:web', 'critical', 'Web unreachable', 'HTTP 503', self.now-90)
+        self.store.resolve_alert('container:web', self.now-30)
+        self.store.resolve_alert('http:web', self.now-10)
+        brief = self.store.daily_brief(self.now)
+        self.assertEqual(brief['incidents'], 2)
+        self.assertEqual(brief['recoveries'], 2)
+        self.assertLess(brief['observedUptime'], 100)
+        self.assertEqual(brief['peakTemperature'], 50)
 
 
 if __name__ == '__main__':

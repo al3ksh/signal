@@ -37,7 +37,7 @@ class SecurityTests(unittest.TestCase):
             return e
 
     def test_private_endpoints_require_session(self):
-        for path in ['/api/status', '/api/history?range=7d', '/api/alerts', '/api/containers/abcdef123456/logs', '/api/containers/abcdef123456/details']:
+        for path in ['/api/status', '/api/history?range=7d', '/api/brief', '/api/alerts', '/api/containers/abcdef123456/logs', '/api/containers/abcdef123456/details']:
             with self.subTest(path=path):
                 response = self.request(path)
                 self.assertEqual(response.status, 401)
@@ -71,6 +71,13 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(self.request('/api/alerts/1/ack', 'POST').status, 401)
         self.assertEqual(self.request('/api/alerts/1/ack', 'POST', headers={'Origin':'https://evil.example', 'Cookie':'signal_session='+server.make_session()}).status, 403)
 
+    def test_service_configuration_requires_private_same_origin_session(self):
+        for path, body in [('/api/checks', {'service':'web','name':'Home','url':'https://example.com'}),
+                           ('/api/maintenance', {'service':'web','until':None})]:
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path, 'POST', body).status, 401)
+                self.assertEqual(self.request(path, 'POST', body, {'Origin':'https://evil.example', 'Cookie':'signal_session='+server.make_session()}).status, 403)
+
     def test_ack_updates_active_snapshot_immediately(self):
         updated = [{'id': 1, 'acknowledged': 123.0}]
         class FakeStore:
@@ -98,6 +105,10 @@ class SecurityTests(unittest.TestCase):
         class FakeEngine:
             def __init__(self): self.calls = []
             def set_muted(self, name, muted, now): self.calls.append((name, muted))
+            def decorate(self, data):
+                for container in data['containers']:
+                    container['monitoringMuted'] = self.calls[-1][1]
+                    container['monitoringMuteSource'] = 'manual' if self.calls[-1][1] else None
         previous = self.httpd.monitor
         engine = FakeEngine()
         self.httpd.monitor = type('Monitor', (), {

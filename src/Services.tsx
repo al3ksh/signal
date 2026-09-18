@@ -1,0 +1,44 @@
+import { useEffect, useRef, useState } from 'react';
+import { ArrowUpRight, CheckCircle, ClockCountdown, Globe, PauseCircle, Plus, Stack, Trash, WarningCircle, X } from '@phosphor-icons/react';
+import type { Container, HttpCheck } from './main';
+import type { Alert } from './History';
+import './services.css';
+
+export type ServiceGroup = {name:string;containers:Container[];checks:HttpCheck[];maintenanceUntil:number|null|undefined};
+
+export function groupServices(containers:Container[],checks:HttpCheck[],maintenance:Record<string,number|null>):ServiceGroup[]{
+  const names=new Set([...containers.map(c=>c.project||'standalone'),...checks.map(c=>c.service||'standalone')]);
+  return [...names].sort().map(name=>({name,containers:containers.filter(c=>(c.project||'standalone')===name),checks:checks.filter(c=>(c.service||'standalone')===name),maintenanceUntil:Object.prototype.hasOwnProperty.call(maintenance,name)?maintenance[name]:undefined}));
+}
+const good=(c:Container)=>c.state==='running'&&c.health!=='unhealthy';
+const serviceState=(service:ServiceGroup)=>
+  service.maintenanceUntil!==undefined?'maintenance':
+  service.containers.some(c=>!good(c)&&!c.monitoringMuted)||service.checks.some(c=>c.ok===false)?'issue':
+  service.containers.length>0&&service.containers.every(c=>!good(c)&&c.monitoringMuted)?'quiet':
+  'healthy';
+const untilText=(until:number|null|undefined)=>until===undefined?'':until===null?'until resumed':`until ${new Date(until*1000).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}`;
+
+export function Services({services,canManage,selected,setSelected,onPatch,onChecks}:{services:ServiceGroup[];canManage:boolean;selected:string|null;setSelected:(name:string|null)=>void;onPatch:(patch:{maintenance:Record<string,number|null>;containers:Container[];checks:HttpCheck[];alerts:Alert[]})=>void;onChecks:(checks:HttpCheck[],alerts?:Alert[])=>void}){
+  const service=services.find(item=>item.name===selected)||null;
+  return <><section className="services-panel"><div className="section-heading"><h2><Stack size={19}/>Services<span>{services.length.toString().padStart(2,'0')}</span></h2><span className="small-label">COMPOSE PROJECTS + ENDPOINTS</span></div>
+    <div className="service-grid">{services.map(item=>{const state=serviceState(item),running=item.containers.filter(good).length,cpu=item.containers.reduce((sum,c)=>sum+(c.cpu||0),0),memory=item.containers.reduce((sum,c)=>sum+(c.memory||0),0);return <button className={`service-card is-${state}`} key={item.name} onClick={()=>setSelected(item.name)}><header><span className="service-mark"><Stack size={18}/></span><span className="service-state"><i className={`dot ${state==='issue'?'bad':state==='maintenance'||state==='quiet'?'neutral':''}`}/>{state==='healthy'?'Nominal':state==='issue'?'Needs attention':state==='quiet'?'Intentionally quiet':'Maintenance'}</span><ArrowUpRight size={16}/></header><strong>{item.name}</strong><p>{running}/{item.containers.length} containers running · {item.checks.length} endpoint {item.checks.length===1?'check':'checks'}</p><footer><span>CPU {cpu.toFixed(1)}%</span><span>{memory>0?`${(memory/1024/1024).toFixed(0)} MiB`:'No memory sample'}</span></footer>{state==='maintenance'&&<small><ClockCountdown size={12}/>{untilText(item.maintenanceUntil)}</small>}</button>;})}
+    {services.length===0&&<div className="empty"><Stack size={28}/><h3>No services discovered yet.</h3><p>Compose projects and configured endpoint checks appear here.</p></div>}</div>
+  </section>{service&&<ServiceDialog service={service} canManage={canManage} onClose={()=>setSelected(null)} onPatch={onPatch} onChecks={onChecks}/>}</>;
+}
+
+function ServiceDialog({service,canManage,onClose,onPatch,onChecks}:{service:ServiceGroup;canManage:boolean;onClose:()=>void;onPatch:(patch:{maintenance:Record<string,number|null>;containers:Container[];checks:HttpCheck[];alerts:Alert[]})=>void;onChecks:(checks:HttpCheck[],alerts?:Alert[])=>void}){
+  const ref=useRef<HTMLDialogElement>(null);
+  const [busy,setBusy]=useState(false),[error,setError]=useState(''),[name,setName]=useState('Homepage'),[url,setUrl]=useState(''),[custom,setCustom]=useState('');
+  useEffect(()=>{ref.current?.showModal();},[]);
+  async function maintenance(until:number|null){setBusy(true);setError('');try{const response=await fetch('/api/maintenance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service:service.name,until})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not update maintenance mode.');onPatch(result);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
+  async function saveCheck(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{const response=await fetch('/api/checks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service:service.name,name,url})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not save this check.');onChecks(result.checks,result.alerts);setUrl('');}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
+  async function removeCheck(id:string){setBusy(true);setError('');try{const response=await fetch('/api/checks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',id})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not remove this check.');onChecks(result.checks,result.alerts);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
+  const maintained=service.maintenanceUntil!==undefined;
+  return <dialog ref={ref} className="service-dialog" onCancel={onClose} onClick={e=>{if(e.target===e.currentTarget)onClose();}} aria-labelledby="service-title"><div><header><span className="mono">SERVICE / {service.name}</span><button className="icon-button" onClick={onClose} aria-label="Close service"><X size={21}/></button></header><Stack size={34} className="lime"/><h2 id="service-title">{service.name}</h2><p className="service-summary">{service.containers.length} containers · {service.checks.length} HTTP checks</p>
+    <section className={`maintenance-box ${maintained?'active':''}`}><div><PauseCircle size={20}/><span><strong>Maintenance window</strong><small>{maintained?`Alerts paused ${untilText(service.maintenanceUntil)}.`:'Temporarily suppress service and endpoint incidents.'}</small></span></div>{canManage&&<div className="maintenance-actions">{maintained?<button disabled={busy} onClick={()=>void maintenance(Date.now()/1000-1)}>Resume monitoring</button>:<><button disabled={busy} onClick={()=>void maintenance(Date.now()/1000+3600)}>1 hour</button><button disabled={busy} onClick={()=>void maintenance(Date.now()/1000+86400)}>24 hours</button><button disabled={busy} onClick={()=>void maintenance(null)}>Until resumed</button></>}<label>Custom end<input type="datetime-local" value={custom} onChange={e=>setCustom(e.target.value)}/></label><button disabled={busy||!custom} onClick={()=>void maintenance(new Date(custom).getTime()/1000)}>Set</button></div>}</section>
+    {error&&<p className="error" role="alert">{error}</p>}
+    <section className="service-detail"><h3>Containers</h3>{service.containers.map(container=><div className="service-row" key={container.id}><span className={`dot ${good(container)?'':'bad'}`}/><span><strong>{container.name}</strong><small>{container.service||container.image}</small></span><b>{container.monitoringMuted?'Muted':container.state}</b></div>)}</section>
+    <section className="service-detail"><h3>HTTP checks</h3>{service.checks.map(check=><div className="service-row" key={check.id}><span className={`check-icon ${check.ok===false?'bad':''}`}>{check.ok===false?<WarningCircle/>:<CheckCircle/>}</span><span><strong>{check.name}</strong><small>{check.url}</small></span><b>{check.ok===null||check.ok===undefined?'Pending':check.ok?`${check.status} · ${check.latency?.toFixed(0)} ms`:check.message}</b>{canManage&&check.source!=='label'&&<button className="icon-button" disabled={busy} aria-label={`Remove ${check.name}`} onClick={()=>void removeCheck(check.id)}><Trash size={15}/></button>}</div>)}{service.checks.length===0&&<p className="service-empty">No endpoint checks. Add the public or local health URL that represents this service.</p>}
+      {canManage&&<form className="check-form" onSubmit={saveCheck}><Globe size={18}/><input aria-label="Check name" value={name} onChange={e=>setName(e.target.value)} placeholder="Check name" required/><input aria-label="HTTP check URL" type="url" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://example.com/health" required/><button disabled={busy}><Plus size={15}/>Add check</button></form>}
+    </section></div></dialog>;
+}

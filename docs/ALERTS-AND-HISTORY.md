@@ -6,7 +6,7 @@ Host CPU, memory, temperature and network throughput are collected every 5 secon
 
 Writes are buffered for up to 30 seconds to reduce storage churn. A normal shutdown flushes the buffer; a power failure can lose the last buffered interval. SQLite uses WAL. Restarting SIGNAL preserves saved measurements and alerts. Downtime is not filled with invented values; chart paths break between missing buckets. A partially filled bucket represents only observed samples, not the entire time bucket.
 
-History starts at installation. Container logs and per-container CPU/RAM history are not persisted. The signal journal remains a short in-memory list of container state transitions; the alert journal is durable.
+History starts at installation. Container logs and per-container CPU/RAM history are not persisted. The signal journal remains a short in-memory list of container state transitions; the alert journal is durable. The history screen places incidents on the telemetry timeline. Selecting a marker draws the incident time through each chart so host conditions can be inspected around the failure.
 
 ## Incident rules
 
@@ -18,6 +18,7 @@ History starts at installation. Container logs and per-container CPU/RAM history
 | CPU at least 90% | 60 seconds | Below 80% |
 | RAM usage at least 90% | 60 seconds | Below 85% |
 | System disk usage at least 90% | 60 seconds | Below 87% |
+| Configured HTTP endpoint returns an error or cannot connect | 30 seconds | Successful HTTP 2xx/3xx response |
 
 Detection is sampled, so opening can be delayed by one sample interval. An unavailable temperature does not create an alarm or falsely resolve an existing one. During a Docker outage, existing container incidents remain unchanged; an unreadable inventory does not mean every container disappeared.
 
@@ -36,6 +37,8 @@ services:
 Compose one-off jobs are also ignored. For intentional decommissioning, apply the ignore label and allow a sample before removing the service. Label changes require recreating the affected container using its own deployment workflow.
 
 For services that are switched off temporarily, open the container inspector and choose **Mute alerts**. SIGNAL keeps the container and its real Docker state visible, removes it from the needs-attention count, resolves any open incident for that container, and suppresses new incidents until **Unmute alerts** is selected. This preference is stored in SIGNAL's SQLite database and survives restarts. It does not start, stop, or modify the Docker container. A `signal.ignore: "true"` label takes precedence and cannot be unmuted from the dashboard.
+
+Maintenance works at the Compose-project service level. A window can last one hour, 24 hours, until a custom date, or until manually resumed. It resolves open container and HTTP-check incidents in that service and suppresses new ones while preserving real Docker and HTTP state in the interface. Expired windows resume monitoring automatically. Maintenance preferences survive SIGNAL restarts.
 
 One incident stays open for each condition until recovery. A recurrence creates a new incident. Acknowledgement marks an incident as seen by this shared-password account; it does not suppress the condition or resolve it. Resolved incidents are kept for 7 days; active incidents stay until recovery. The panel displays up to 250 incidents.
 
