@@ -352,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
                     current['monitoringMuteSource'] = 'label' if current.get('ignoreAlerts') else ('manual' if muted else None)
                 if snapshot is not None:
                     snapshot['alerts'] = alerts
-                result = {'ok': True, 'name': container['name'], 'monitoringMuted': muted or container.get('ignoreAlerts', False), 'monitoringMuteSource': 'label' if container.get('ignoreAlerts') else ('manual' if muted else None)}
+                result = {'ok': True, 'name': container['name'], 'monitoringMuted': muted or container.get('ignoreAlerts', False), 'monitoringMuteSource': 'label' if container.get('ignoreAlerts') else ('manual' if muted else None), 'alerts': alerts}
             return self.json(200, result)
         if path != '/api/login' or not AUTH:
             return self.json(404, {'error': 'Unknown endpoint.'})

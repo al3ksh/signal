@@ -6,7 +6,7 @@ import './history.css';
 export type Alert = {id:number;key:string;severity:string;title:string;message:string;opened:number;resolved:number|null;acknowledged:number|null};
 const date = (value:number) => new Date(value*1000).toLocaleString('en-GB', {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
 
-export function AlertJournal({alerts,onUpdate,canAcknowledge}:{alerts:Alert[];onUpdate:()=>void;canAcknowledge:boolean}) {
+export function AlertJournal({alerts,onAcknowledge,canAcknowledge}:{alerts:Alert[];onAcknowledge:(id:number,acknowledged:number)=>void;canAcknowledge:boolean}) {
   const [filter,setFilter] = useState('all');
   const [error,setError] = useState('');
   const [busy,setBusy] = useState<number|null>(null);
@@ -17,8 +17,9 @@ export function AlertJournal({alerts,onUpdate,canAcknowledge}:{alerts:Alert[];on
   const active = alerts.filter(a=>a.resolved===null);
   const visible = alerts.filter(a=>filter==='all'||(filter==='active'?a.resolved===null:a.resolved!==null));
   async function acknowledge(id:number) {
-    setBusy(id);setError('');setOptimistic(current=>({...current,[id]:Date.now()/1000}));
-    try {const response=await fetch(`/api/alerts/${id}/ack`,{method:'POST'});if(!response.ok)throw new Error('Could not acknowledge this alert. Try again.');onUpdate();}
+    const acknowledged=Date.now()/1000;
+    setBusy(id);setError('');setOptimistic(current=>({...current,[id]:acknowledged}));
+    try {const response=await fetch(`/api/alerts/${id}/ack`,{method:'POST'});if(!response.ok)throw new Error('Could not acknowledge this alert. Try again.');onAcknowledge(id,acknowledged);}
     catch(e){setOptimistic(current=>{const next={...current};delete next[id];return next;});setError((e as Error).message);}finally{setBusy(null);}
   }
   return <section className="alert-journal" aria-label="Alert history">

@@ -107,6 +107,7 @@ class SecurityTests(unittest.TestCase):
         try:
             response = self.request(path, 'POST', {'muted': True}, {'Cookie':'signal_session='+server.make_session()})
             self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response)['alerts'], [])
             self.assertEqual(engine.calls, [('worker', True)])
             self.assertTrue(self.httpd.monitor.snapshot['containers'][0]['monitoringMuted'])
         finally:
