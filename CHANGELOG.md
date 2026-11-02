@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added an optional app registry and a separate runner (`runner.py`) that reports each Compose app's deployed commit and how many commits it is behind its repository branch. A new Apps view appears only when `SIGNAL_CONTROL_SOCKET` is set and the runner is reachable.
+
 ## 2.2.0 — 2026-09-18
 
 - Added persistent per-container alert muting from the inspector. Muted containers remain visible with their real Docker state, leave the needs-attention count, and no longer keep incidents active.

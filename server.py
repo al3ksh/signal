@@ -3,6 +3,7 @@ import concurrent.futures
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import mimetypes
 import os
@@ -36,6 +37,16 @@ AUTH = json.loads(AUTH_FILE.read_text()) if AUTH_FILE.exists() else None
 PUBLIC_MODE = os.getenv('SIGNAL_PUBLIC_MODE') == '1'
 ATTEMPTS = {}
 AUTH_LOCK = threading.Lock()
+# Optional app control: SIGNAL never touches Docker for writes; it asks the separate runner over a Unix socket.
+CONTROL_SOCKET = os.getenv('SIGNAL_CONTROL_SOCKET') or None
+CONTROL_ALLOW = [ipaddress.ip_network(item.strip(), strict=False) for item in
+                 os.getenv('SIGNAL_CONTROL_ALLOW', '100.64.0.0/10,127.0.0.1/32,::1/128,fd7a:115c:a1e0::/48').split(',') if item.strip()]
+CONTROL_ACTIONS = ('start', 'stop', 'restart', 'check', 'update', 'rollback')
+CONTROL_GRANT_SECONDS = 600
+CONTROL_ATTEMPTS = {}
+CONTROL_RATE = {}
+CONTROL_CACHE = {}
+TUNNEL_HEADERS = ('Cf-Ray', 'Cf-Connecting-Ip', 'Cf-Visitor', 'Cf-Ipcountry')
 
 
 def make_session(expiry=None):
@@ -53,6 +64,77 @@ def valid_session(token):
         return int(payload.split('.')[0]) > time.time() and hmac.compare_digest(signature, expected)
     except (ValueError, AttributeError):
         return False
+
+
+class ControlError(Exception):
+    def __init__(self, message, code='unavailable'):
+        super().__init__(message)
+        self.code = code
+
+
+def control_call(request, timeout=8):
+    """One newline-delimited JSON request to the runner. Only fixed ops and validated values are sent."""
+    if not CONTROL_SOCKET:
+        raise ControlError('App control is not configured.')
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(CONTROL_SOCKET)
+            sock.sendall(json.dumps(request).encode() + b'\n')
+            line = sock.makefile('rb').readline(4 * 1024 * 1024)
+        response = json.loads(line)
+    except (OSError, ValueError) as exc:
+        raise ControlError('The app runner is not reachable.') from exc
+    if not isinstance(response, dict) or not response.get('ok'):
+        raise ControlError(str((response or {}).get('error') or 'The runner refused the request.')[:300], (response or {}).get('code', 'invalid'))
+    return response
+
+
+def control_available():
+    """Cached reachability so /api/session does not hit the runner on every page load."""
+    if not CONTROL_SOCKET:
+        return False
+    now = time.monotonic()
+    cached = CONTROL_CACHE.get('available')
+    if cached and now - cached[0] < 10:
+        return cached[1]
+    try:
+        control_call({'op': 'list'}, timeout=3)
+        result = True
+    except ControlError:
+        result = False
+    CONTROL_CACHE['available'] = (now, result)
+    return result
+
+
+def make_control_grant(session_token, expiry=None):
+    """A 10-minute step-up grant bound to one session token, signed with a separate HMAC domain."""
+    payload = str(expiry or int(time.time()) + CONTROL_GRANT_SECONDS) + '.' + secrets.token_hex(8)
+    message = ('control:' + payload + ':' + session_token.rsplit('.', 1)[0]).encode()
+    return payload + '.' + hmac.new(bytes.fromhex(AUTH['secret']), message, hashlib.sha256).hexdigest()
+
+
+def valid_control_grant(grant, session_token):
+    if not AUTH or not grant or not session_token:
+        return False
+    try:
+        payload, signature = grant.rsplit('.', 1)
+        message = ('control:' + payload + ':' + session_token.rsplit('.', 1)[0]).encode()
+        expected = hmac.new(bytes.fromhex(AUTH['secret']), message, hashlib.sha256).hexdigest()
+        return time.time() < int(payload.split('.')[0]) and hmac.compare_digest(signature, expected)
+    except (ValueError, AttributeError):
+        return False
+
+
+def join_apps(apps, containers):
+    """Registry entries from the runner joined with containers SIGNAL already observes (project label == app id)."""
+    result = []
+    for app in apps:
+        items = sorted((c for c in containers if c.get('project') == app.get('id')), key=lambda c: c['name'])
+        running = sum(c['state'] == 'running' for c in items)
+        result.append({**app, 'containers': {'running': running, 'total': len(items), 'unhealthy': sum(c.get('health') == 'unhealthy' for c in items),
+                                             'items': [{'name': c['name'], 'service': c.get('service', ''), 'state': c['state'], 'health': c.get('health')} for c in items]}})
+    return result
 
 
 class UnixConnection(http.client.HTTPConnection):
@@ -370,6 +452,37 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    def cookie_value(self, name):
+        try:
+            item = SimpleCookie(self.headers.get('Cookie', '')).get(name)
+            return item.value if item else ''
+        except Exception:
+            return ''
+
+    def peer(self):
+        address = ipaddress.ip_address(self.client_address[0].split('%')[0])
+        return address.ipv4_mapped or address if address.version == 6 else address
+
+    def via_tunnel(self):
+        # cloudflared connects from loopback, so the socket peer alone cannot tell public traffic apart.
+        # Cloudflare's edge always adds these headers and clients cannot strip them; treat their presence as public.
+        return any(self.headers.get(name) is not None for name in TUNNEL_HEADERS)
+
+    def control_network_allowed(self):
+        if self.via_tunnel():
+            return False
+        try:
+            peer = self.peer()
+        except ValueError:
+            return False
+        return any(peer.version == network.version and peer in network for network in CONTROL_ALLOW)
+
+    def control_state(self, available=None):
+        available = control_available() if available is None else available
+        allowed = bool(available and AUTH and self.authenticated() and self.control_network_allowed())
+        granted = allowed and valid_control_grant(self.cookie_value('signal_control'), self.cookie_value('signal_session'))
+        return {'available': bool(available), 'allowed': allowed, 'granted': granted}
+
     def cookie(self, token, age):
         secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
         self.cookie_header = 'signal_session=' + token + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + str(age) + secure
@@ -518,9 +631,11 @@ class Handler(BaseHTTPRequestHandler):
             healthy = bool(snapshot and time.time()-snapshot.get('timestamp', 0) < max(60, INTERVAL*4))
             return self.json(200 if healthy else 503, {'ok': healthy})
         if path == '/api/session':
-            return self.json(200, {'authenticated': self.authenticated(), 'authEnabled': AUTH is not None, 'logs': AUTH is not None})
+            return self.json(200, {'authenticated': self.authenticated(), 'authEnabled': AUTH is not None, 'logs': AUTH is not None, 'control': self.control_state()})
         if path.startswith('/api/') and not self.authenticated():
             return self.json(401, {'error': 'Sign in to view system data.'})
+        if path.startswith(('/api/apps', '/api/jobs/')):
+            return self.control_get(path, parse_qs(parsed.query))
         if path == '/api/history':
             ranges = {'1h': 3600, '24h': 86400, '7d': 604800}
             value = parse_qs(parsed.query).get('range', ['24h'])[0]
@@ -569,6 +684,23 @@ class Handler(BaseHTTPRequestHandler):
         if file.suffix == '.js':
             mime = 'application/javascript'
         self.reply(200, file.read_bytes(), mime)
+
+    def control_get(self, path, query):
+        if not CONTROL_SOCKET:
+            return self.json(404, {'error': 'Unknown endpoint.'})
+        try:
+            if path == '/api/apps':
+                apps = control_call({'op': 'list'})['apps']
+                CONTROL_CACHE['available'] = (time.monotonic(), True)
+                with self.server.monitor.lock:
+                    containers = list((self.server.monitor.snapshot or {}).get('containers', []))
+                return self.json(200, {'apps': join_apps(apps, containers), 'control': self.control_state(True)})
+            return self.json(404, {'error': 'Unknown endpoint.'})
+        except ControlError as exc:
+            if exc.code == 'unavailable':
+                CONTROL_CACHE['available'] = (time.monotonic(), False)
+                return self.json(503, {'error': str(exc)})
+            return self.json(404 if exc.code == 'not_found' else 409 if exc.code == 'conflict' else 400, {'error': str(exc)})
 
     def log_message(self, fmt, *args):
         if args and str(args[1]) not in ('200', '304'):
