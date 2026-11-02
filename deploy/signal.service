@@ -8,6 +8,9 @@ Type=simple
 User=signal
 Group=signal
 SupplementaryGroups=docker
+# With app control's read-only Docker proxy, drop the docker group instead:
+#SupplementaryGroups=signal-control
+#Environment=DOCKER_SOCKET=/run/signal-runner/docker-ro.sock
 WorkingDirectory=/opt/signal
 ExecStart=/usr/bin/python3 /opt/signal/server.py
 Environment=SIGNAL_HOST=127.0.0.1

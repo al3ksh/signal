@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -765,6 +766,97 @@ class SpeedTests(RunnerCase):
         fixture.push('web change')
         self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
         self.assertEqual(self.build_args(fixture), [['build', '--pull']])
+
+
+class DockerProxyTests(unittest.TestCase):
+    """The read-only Docker socket lets SIGNAL run without docker group membership."""
+    def setUp(self):
+        import http.server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.seen = []
+        seen = self.seen
+        class Daemon(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def do_GET(self):
+                seen.append(('GET', self.path))
+                body = json.dumps({'path': self.path, 'ApiVersion': '1.44', 'MinAPIVersion': '1.24', 'Version': '29.2.1'}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_POST(self):
+                seen.append(('POST', self.path))
+                self.send_response(204)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+            def address_string(self):
+                return 'unix'
+        class UnixHTTP(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+        self.docker_path = os.path.join(self.tmp.name, 'docker.sock')
+        self.daemon = UnixHTTP(self.docker_path, Daemon)
+        threading.Thread(target=self.daemon.serve_forever, daemon=True).start()
+        self.proxy_path = os.path.join(self.tmp.name, 'docker-ro.sock')
+        self.proxy = runner.serve_docker_proxy(self.proxy_path, self.docker_path)
+        threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        for item in (self.proxy, self.daemon):
+            item.shutdown()
+            item.server_close()
+        self.tmp.cleanup()
+
+    def raw(self, request):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(self.proxy_path)
+            sock.sendall(request)
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return b''.join(chunks)
+                chunks.append(chunk)
+
+    def test_signal_reads_docker_through_the_proxy(self):
+        import server
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'DOCKER_SOCKET': self.proxy_path}), patch.object(server, 'DOCKER_API', None):
+            self.assertEqual(server.docker_get('/version')['Version'], '29.2.1')
+            self.assertEqual(server.docker_get('/containers/json?all=1')['path'], '/v1.44/containers/json?all=1')
+            cid = 'ab' * 32
+            for path in ['/containers/' + cid + '/stats?stream=false&one-shot=true', '/containers/' + cid[:12] + '/json',
+                         '/containers/' + cid[:12] + '/logs?stdout=true&stderr=true&timestamps=true&tail=160']:
+                self.assertEqual(server.docker_get(path)['path'], '/v1.44' + path)
+        self.assertEqual(oct(os.stat(self.proxy_path).st_mode & 0o777), '0o660')
+
+    def test_everything_else_is_refused_before_reaching_docker(self):
+        for request in [b'POST /v1.44/containers/abcdefabcdef/restart HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'DELETE /v1.44/containers/abcdefabcdef HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'GET /v1.44/containers/abcdefabcdef/exec HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'GET /v1.44/images/json HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'GET /v1.44/secrets HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'GET /v1.44/containers/../secrets HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'GET /v1.44/containers/%2e%2e/secrets/json HTTP/1.1\r\nHost: d\r\n\r\n',
+                        b'GET /v1.44/containers/json HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\n{}',
+                        b'GET /v1.44/containers/json HTTP/1.1\r\nHost: d\r\nUpgrade: tcp\r\n\r\n',
+                        b'GET /v1.44/containers/json HTTP/1.1\r\nHost: d\r\n\r\nPOST /v1.44/containers/abcdefabcdef/kill HTTP/1.1\r\n\r\n',
+                        b'GET http://evil/v1.44/containers/json HTTP/1.1\r\n\r\n',
+                        b'garbage\r\n\r\n']:
+            with self.subTest(request=request[:50]):
+                self.assertTrue(self.raw(request).startswith(b'HTTP/1.1 403'))
+        self.assertEqual(self.seen, [])
+
+    def test_socket_group_is_applied(self):
+        import grp
+        group = grp.getgrgid(os.getgid()).gr_name
+        path = os.path.join(self.tmp.name, 'grouped.sock')
+        proxy = runner.serve_docker_proxy(path, self.docker_path, group=group)
+        proxy.server_close()
+        self.assertEqual(os.stat(path).st_gid, os.getgid())
+        with self.assertRaises(SystemExit):
+            runner.serve_docker_proxy(os.path.join(self.tmp.name, 'x.sock'), self.docker_path, group='no-such-group-signal')
 
 
 class SocketTests(RunnerCase):
