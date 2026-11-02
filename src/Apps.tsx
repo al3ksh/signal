@@ -12,7 +12,7 @@ export const ago=(seconds?:number|null)=>{if(!seconds)return '—';const d=Math.
 export const appState=(app:ManagedApp)=>app.containers.total===0?'stopped':app.containers.unhealthy>0||app.containers.running<app.containers.total?(app.containers.running===0?'stopped':'degraded'):'running';
 const stateText:Record<string,string>={running:'Running',degraded:'Degraded',stopped:'Stopped'};
 export type Action='start'|'stop'|'restart'|'check'|'update'|'rollback';
-export const actionLabel:Record<Action,string>={start:'Start',stop:'Stop',restart:'Restart',check:'Check now',update:'Update',rollback:'Roll back'};
+export const actionLabel:Record<string,string>={start:'Start',stop:'Stop',restart:'Restart',check:'Check now',update:'Update',rollback:'Roll back',recover:'Recover'};
 export const busyApp=(app:ManagedApp)=>!!app.activeJob;
 async function postAction(app:string,action:Action,password?:string){const r=await fetch(`/api/apps/${app}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(password?{password}:{})});const d=await r.json().catch(()=>({}));return {ok:r.ok,status:r.status,data:d as {job?:Job;error?:string;stepUp?:boolean}};}
 
@@ -78,7 +78,7 @@ function ConfirmDialog({app,action,granted,onClose,onDone}:{app:ManagedApp;actio
   </form></dialog>;
 }
 
-const STEPS:Record<string,string[]>={update:['fetch','build','up','health','done'],rollback:['fetch','build','up','health','done']};
+const STEPS:Record<string,string[]>={update:['fetch','build','up','health','done'],rollback:['fetch','build','up','health','done'],recover:['rollback','up','health','done']};
 const terminal=(job:Job)=>!['queued','running'].includes(job.status);
 const statusIcon=(status:string)=>status==='succeeded'?<CheckCircle size={14}/>:status==='rolled_back'||status==='cancelled'?<ArrowCounterClockwise size={14}/>:status==='failed'?<XCircle size={14}/>:<i className="dot"/>;
 

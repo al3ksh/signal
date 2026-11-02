@@ -26,8 +26,9 @@ StateDirectory=signal-runner
 StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=5
-# A build may be running; give it time to be cancelled and recorded.
-TimeoutStopSec=30
+# Stopping cancels running jobs, which roll back. Give that time; a deploy cut off anyway is
+# rolled back automatically on the next start.
+TimeoutStopSec=90
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/signal-runner /home/alexpi/apps -/home/alexpi/.docker

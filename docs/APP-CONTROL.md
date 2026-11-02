@@ -109,6 +109,8 @@ All commands run with `cwd` set to the app directory and `docker compose --proje
 
 **Health** passes when every project container is running and not `unhealthy`/`starting` (exited containers with exit code 0 count as finished one-shot services), and, if configured, the health URL answers the expected status. It is polled every 2 s until `timeoutSeconds`.
 
+**Recovery after a restart:** a deploy interrupted after the checkout moved is rolled back automatically when the runner starts again (see Troubleshooting).
+
 **Automatic rollback:** if anything fails after the checkout moved — build, pull, `up`, health, or you press **Cancel** — the runner resets to the exact previous commit, restores the saved images (or rebuilds when none were saved), runs `up -d` and checks health again. The job ends as `rolled back` with the reason, or `failed` if the rollback itself failed (the log says why). Untracked files (`.env`, data folders) are never touched.
 
 Every compose command receives `SIGNAL_COMMIT=<deployed commit sha>` in its environment.
@@ -172,4 +174,4 @@ Web server: `SIGNAL_CONTROL_SOCKET` (unset = control off) and `SIGNAL_CONTROL_AL
 - **Update refused, "local changes":** someone edited tracked files on the Pi. Inspect with `git -C <dir> status`, then commit/push, stash or discard.
 - **Update refused, "diverged":** the Pi checkout has commits that are not on the remote. Push them or reset the checkout deliberately; the runner only fast-forwards.
 - **Permission denied on `.git`:** the app directory must be writable by the runner user (`alexpi`) and inside `ReadWritePaths`.
-- **Job interrupted:** a runner restart marks running jobs as failed. Run **Check now**; if the checkout moved, run **Roll back** or **Update** again.
+- **Job interrupted:** a runner restart (service stop, reboot) marks unfinished jobs as failed. If a deploy was cut off after its checkout moved, the runner starts a **Recover** job on start-up that resets to the commit the deploy started from, restores its saved images, runs `up -d` and checks health. It does this only while the checkout is still exactly where the interrupted job left it; if someone changed it by hand, the runner leaves it alone and logs why.

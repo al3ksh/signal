@@ -178,8 +178,11 @@ class JobStore:
         return public_job(self.row(job_id))
 
     def recover(self, now):
+        """Mark jobs a previous runner left unfinished as failed; return them so moved checkouts can be restored."""
         with self.lock, self.db:
+            rows = [dict(r) for r in self.db.execute("SELECT * FROM jobs WHERE status IN ('queued','running')")]
             self.db.execute("UPDATE jobs SET status='failed', finished=?, message='Runner restarted; job interrupted.' WHERE status IN ('queued','running')", (now,))
+            return rows
 
     def prune(self, keep):
         with self.lock, self.db:
@@ -217,7 +220,7 @@ class Runner:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = JobStore(self.data_dir / 'jobs.db')
-        self.store.recover(time.time())
+        interrupted = self.store.recover(time.time())
         self.logs = self.data_dir / 'logs'
         self.logs.mkdir(exist_ok=True)
         self.timeouts = dict(TIMEOUTS)
@@ -232,6 +235,7 @@ class Runner:
         self.app_locks = {app_id: threading.Lock() for app_id in apps}
         self.stop = threading.Event()
         self.checker = None
+        self.recover_interrupted(interrupted)
 
     # -- process execution -------------------------------------------------
     def env(self, extra=None):
@@ -308,10 +312,36 @@ class Runner:
         self.checker.start()
 
     # -- jobs --------------------------------------------------------------
-    def submit(self, app_id, action, actor):
+    def recover_interrupted(self, rows):
+        """A deploy killed after the checkout moved (runner stopped, host rebooted) is rolled back to the
+        commit it started from, but only while the checkout is still exactly where that job left it."""
+        for row in rows:
+            app = self.apps.get(row['app'])
+            prev, new = row.get('prev_commit'), row.get('new_commit')
+            if (row['action'] not in ('update', 'rollback', 'recover') or not app or not app['repo'] or not prev or not new
+                    or prev == new or row.get('phase') not in ('build', 'pull', 'up', 'health', 'rollback')):
+                continue
+            head = self.head(app)
+            if head not in (prev, new):
+                print(f"Not recovering {row['app']}: checkout is at {(head or '?')[:7]}, not where job {row['id'][:12]} left it.", flush=True)
+                continue
+            job = self.submit(app['id'], 'recover', 'runner (recovery)', source=row)
+            self.store.update(row['id'], message=f"Runner restarted during {row['phase']}; recovery job {job['id'][:12]} restores {prev[:7]}.")
+
+    def do_recover(self, handle, app):
+        row = handle['source']
+        prev, head = row['prev_commit'], self.head(app)
+        self.write(handle, f"# {row['action']} job {row['id'][:12]} was interrupted during {row['phase']}\n")
+        self.store.update(handle['id'], prev_commit=head, new_commit=prev)
+        branch = self.jgit(handle, app, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
+        if branch != app['repo']['branch']:
+            raise StepFailed(f"Checked out {branch or 'a detached HEAD'}, but the registry expects {app['repo']['branch']}. Not recovering automatically.")
+        self.restore(handle, app, prev, json.loads(row.get('images') or '[]'), f"Recovering from an interrupted {row['action']}")
+
+    def submit(self, app_id, action, actor, source=None):
         if app_id not in self.apps:
             raise RequestError('Unknown app.', 'not_found')
-        if action not in ACTIONS:
+        if action not in ACTIONS and not (action == 'recover' and source):
             raise RequestError('Unknown action.')
         if action in REPO_ACTIONS and not self.apps[app_id]['repo']:
             raise RequestError('This app has no repository configured.')
@@ -323,7 +353,7 @@ class Runner:
                 raise RequestError('Too many queued jobs.', 'conflict')
             handle = {'id': uuid.uuid4().hex, 'app': app_id, 'action': action, 'actor': actor, 'created': time.time(),
                       'cancelled': threading.Event(), 'proc': None, 'timed_out': False, 'log': None, 'size': 0,
-                      'head': b'', 'total': 0, 'epoch': 0}
+                      'head': b'', 'total': 0, 'epoch': 0, 'source': source}
             self.store.create(handle)
             self.active[handle['id']] = handle
         threading.Thread(target=self.execute, args=(handle,), daemon=True, name='job-' + handle['id'][:8]).start()
