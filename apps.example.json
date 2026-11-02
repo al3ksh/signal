@@ -1,0 +1,43 @@
+{
+  "apps": [
+    {
+      "id": "portfolio",
+      "name": "PortfolioOS",
+      "dir": "/home/alexpi/apps/portfolio",
+      "composeFiles": ["docker-compose.yml", "docker-compose.override.yml"],
+      "repo": {"remote": "origin", "branch": "main"},
+      "health": {"url": "http://127.0.0.1:8080/", "expect": 200, "timeoutSeconds": 90},
+      "update": {"mode": "build"}
+    },
+    {
+      "id": "discord-bot",
+      "name": "BreadMusic",
+      "dir": "/home/alexpi/apps/discord-bot",
+      "composeFiles": ["docker-compose.yml"],
+      "repo": {"remote": "origin", "branch": "main"},
+      "health": {"timeoutSeconds": 120},
+      "update": {"mode": "build"}
+    },
+    {
+      "id": "tools",
+      "name": "Tools",
+      "dir": "/home/alexpi/apps/tools",
+      "composeFiles": ["docker-compose.yml"],
+      "repo": {"remote": "origin", "branch": "main"},
+      "health": {"timeoutSeconds": 90},
+      "update": {"mode": "build"}
+    },
+    {
+      "id": "medium",
+      "name": "Medium",
+      "dir": "/home/alexpi/apps/Medium",
+      "composeFiles": ["docker-compose.prod.yml"],
+      "repo": {"remote": "origin", "branch": "main"},
+      "health": {"timeoutSeconds": 120},
+      "update": {"mode": "build"}
+    },
+    {"id": "ai-browser", "name": "AI Browser", "dir": "/home/alexpi/apps/ai-browser", "composeFiles": ["docker-compose.yml"]},
+    {"id": "lights-out", "name": "Lights Out", "dir": "/home/alexpi/apps/lights-out", "composeFiles": ["docker-compose.yml"]},
+    {"id": "bread-power-dashboard", "name": "Bread Power", "dir": "/home/alexpi/apps/bread-power-dashboard", "composeFiles": ["docker-compose.power.yml"]}
+  ]
+}
