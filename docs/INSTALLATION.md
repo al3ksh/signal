@@ -82,6 +82,24 @@ alexpi ALL=(root) NOPASSWD: /usr/bin/systemctl restart signal.service, /usr/bin/
 
 `deploy/update-signal.sh` remains as a thin wrapper around `deploy.py`.
 
+## Free disk space on the Pi
+
+`deploy/pi-clean.py` finds what can be removed and decides per item, never wholesale. Copy it to the Pi once (it is not part of a SIGNAL deploy) and run it there:
+
+```sh
+ssh alexpi@100.105.170.124 'cat > ~/pi-clean.py' < deploy/pi-clean.py
+ssh -t alexpi@100.105.170.124 sudo python3 pi-clean.py            # scan: report only, changes nothing
+ssh -t alexpi@100.105.170.124 sudo python3 pi-clean.py apply      # asks y / each / N per group
+```
+
+Every finding has a size, an age, a safety level and the exact action:
+
+- **safe:** Docker build cache, dangling `<none>` images, journal above 100 MB, atop logs older than 7 days, the apt package cache, SIGNAL deploy backups beyond the newest five and `__pycache__` under `~/apps`. `apply --safe` applies only these, printing each first.
+- **review:** images that no container (running or stopped) and no registered app's compose file uses, with `:signal-prev` rollback images of existing apps excluded; stopped containers older than 14 days with the image space they pin (a Compose project whose containers are all stopped is removed with `docker compose -p <project> down`, volumes kept); and the persistent config changes (journald `SystemMaxUse=100M`, atop `LOGGENERATIONS=7`), which are always separate items.
+- **report-only:** `~/backups` and `~/apps/*backup*`, dangling volumes, and the 15 largest other files over 100 MB. The tool never removes these.
+
+It never runs `docker system prune`, `docker image prune -a` or `docker volume prune`, and it ignores `docker system df`, whose reclaimable figure is wrong with the containerd image store. Each item is re-checked just before it is applied and skipped if it no longer qualifies; every action is logged with the space freed to `/var/log/pi-clean.log`. `--json` prints the scan for scripts.
+
 ## Backup and restore
 
 `sh ./signal backup` briefly stops collection and writes `backups/signal-<UTC timestamp>.tar` with mode 600. It includes the whole data directory (SQLite, WAL if present, password hash and session secret). Treat it as private. Copy it off the monitored host. A stopped service creates a visible gap in history.
