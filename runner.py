@@ -658,6 +658,24 @@ class Runner:
                 raise StepFailed(f'Health check failed after {timeout} s: {problem}')
             time.sleep(min(self.health_poll, remaining))
 
+    def ensure_published(self, handle, app, prev, target):
+        """Before moving the checkout, make sure CI already pushed the images pinned to the target commit
+        (those whose reference changes with SIGNAL_COMMIT). Otherwise the pull would fail and roll back."""
+        def images(commit):
+            code, out, _ = self.quiet(app, self.compose(app, 'config', '--images'), 60, env=self.commit_env(commit))
+            return set(out.split()) if code == 0 else None
+        before, after = images(prev), images(target)
+        if before is None or after is None:
+            return
+        for image in sorted(after - before):
+            if '@' in image or not IMAGE_REF.fullmatch(image):
+                continue
+            code, _, err = self.quiet(app, ['docker', 'manifest', 'inspect', image], 60)
+            self.write(handle, f"$ docker manifest inspect {image}: {'published' if code == 0 else 'not found'}\n")
+            if code != 0:
+                raise StepFailed(f'{image} is not published yet. Wait for the CI build of {target[:7]} to finish, then update again.'
+                                 + (f' ({err[-160:]})' if err and 'no such manifest' not in err.lower() else ''))
+
     def deploy(self, handle, app, prev, move, artifacts):
         """Move the checkout, produce images, start and verify. Any failure after the move restores prev."""
         images = self.save_images(handle, app, prev)
@@ -703,6 +721,8 @@ class Runner:
         if prev == target:
             self.phase(handle, 'done')
             return f'Already up to date with {upstream} at {prev[:7]}.'
+        if app['mode'] == 'pull':
+            self.ensure_published(handle, app, prev, target)
         def artifacts(commit):
             self.phase(handle, 'pull' if app['mode'] == 'pull' else 'build')
             services = self.changed_services(handle, app, prev, commit) if app['mode'] == 'build' else None
