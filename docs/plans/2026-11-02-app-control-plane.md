@@ -1,6 +1,8 @@
 # Plan: SIGNAL app control plane (start / stop / update from repo)
 
-Status: proposed · 2026-11-02 · Written to be executed by a cloud Claude session that has this repository but **no access to the Raspberry Pi**.
+Status: **implemented** · 2026-11-02 · in [al3ksh/signal#1](https://github.com/al3ksh/signal/pull/1), one commit per phase. Not yet installed on the Pi; follow the install section of [APP-CONTROL.md](../APP-CONTROL.md). Written to be executed by a cloud Claude session that has this repository but **no access to the Raspberry Pi**.
+
+Implemented beyond the plan: automatic recovery of deploys interrupted by a runner restart, a CI-image pre-check in pull mode, head+tail job logs, incidents for failed and rolled-back jobs, an optional read-only Docker socket so SIGNAL can run without Docker access, and a Fluent motion layer. Deviations are listed in the PR description ("Decisions to confirm").
 
 ## Goal
 
