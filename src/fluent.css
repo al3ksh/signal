@@ -1,0 +1,73 @@
+/* Fluent motion layer: reveal light, acrylic surfaces, connected and staggered transitions.
+   Every animation here is silenced by :root[data-motion=reduced] and prefers-reduced-motion (interactions.css)
+   and paused in hidden documents. Colors come only from theme tokens. */
+:root{--ease-fluent:cubic-bezier(.1,.9,.2,1);--ease-decel:cubic-bezier(0,0,0,1);--reveal:color-mix(in srgb,var(--accent),transparent 91%);--reveal-edge:color-mix(in srgb,var(--accent),transparent 45%)}
+
+/* Ambient signal field */
+.ambient-field{position:fixed;inset:0;width:100vw;height:100dvh;pointer-events:none;z-index:-1;opacity:.9;mask-image:linear-gradient(180deg,#000,#000 35%,transparent 100%);animation:field-in 1.6s var(--ease-decel)}
+@keyframes field-in{from{opacity:0}}
+:root[data-motion=reduced] .ambient-field{opacity:.55}
+
+/* Reveal highlight: light follows the pointer across surfaces; standalone cards also light their edge. */
+:is(.app-card,.service-card,.alert-shortcut,.metric,.brief-grid article,.app-actions>button,.confirm-dialog footer button,.command-list>button,.refresh-button,.job-history button,.event){background-image:radial-gradient(260px circle at var(--rx,-400px) var(--ry,-400px),var(--reveal),transparent 72%);background-repeat:no-repeat}
+:is(.app-actions>button,.confirm-dialog footer button,.refresh-button,.job-history button){background-image:radial-gradient(90px circle at var(--rx,-400px) var(--ry,-400px),color-mix(in srgb,var(--accent),transparent 84%),transparent 75%)}
+.app-card,.service-card,.alert-shortcut{position:relative;isolation:isolate}
+.app-card::before,.service-card::before,.alert-shortcut::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:radial-gradient(200px circle at var(--rx,-400px) var(--ry,-400px),var(--reveal-edge),transparent 70%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0);opacity:0;transition:opacity 220ms var(--ease-decel);pointer-events:none;z-index:-1}
+.service-card::before{inset:0}
+.app-card:hover::before,.service-card:hover::before,.alert-shortcut:hover::before{opacity:1}
+.app-card{transition:border-color 200ms,transform 260ms var(--ease-fluent),box-shadow 260ms var(--ease-fluent)}
+.app-card:hover{transform:translateY(-2px);box-shadow:0 14px 34px -22px color-mix(in srgb,var(--accent),transparent 55%)}
+.service-card{transition:border-color 200ms,transform 260ms var(--ease-fluent),box-shadow 260ms var(--ease-fluent)}
+.service-card:hover{box-shadow:0 14px 34px -22px color-mix(in srgb,var(--accent),transparent 55%)}
+
+/* Pressed state: controls compress slightly, then spring back. */
+.app-actions>button,.confirm-dialog footer button,.job-cancel button,.behind-badge,.last-job,.primary,.refresh-button,.command-list>button{transition:transform 160ms var(--ease-fluent),border-color 160ms,color 160ms,background-color 160ms,opacity 160ms}
+.app-actions>button:active:not(:disabled),.confirm-dialog footer button:active:not(:disabled),.job-cancel button:active:not(:disabled),.behind-badge:active,.primary:active:not(:disabled),.command-list>button:active{transform:scale(.965)}
+.behind-badge svg{transition:transform 260ms var(--ease-fluent)}
+
+/* Staggered entrances: cards rise in once when a view opens; polling updates do not replay them. */
+.app-card,.service-card,.metric,.brief-grid article{animation:rise-in 520ms var(--ease-fluent) both}
+:is(.app-grid,.service-grid,.metrics,.brief-grid)>:nth-child(2){animation-delay:45ms}:is(.app-grid,.service-grid,.metrics,.brief-grid)>:nth-child(3){animation-delay:90ms}:is(.app-grid,.service-grid,.metrics,.brief-grid)>:nth-child(4){animation-delay:135ms}:is(.app-grid,.service-grid)>:nth-child(5){animation-delay:180ms}:is(.app-grid,.service-grid)>:nth-child(6){animation-delay:225ms}:is(.app-grid,.service-grid)>:nth-child(7){animation-delay:270ms}:is(.app-grid,.service-grid)>:nth-child(n+8){animation-delay:310ms}
+.apps-panel,.services-panel{animation:surface-enter 300ms var(--ease-out)}
+@keyframes rise-in{from{opacity:0;transform:translateY(12px) scale(.985);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
+
+/* Connected navigation indicator */
+.sidebar nav{position:relative}.sidebar nav>button{position:relative;z-index:1}
+.sidebar nav.has-indicator>button.active{background:transparent}
+.nav-indicator{position:absolute;left:0;top:0;border-radius:5px;background:var(--accent-soft);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent),transparent 90%);transition:transform 420ms var(--ease-fluent),width 420ms var(--ease-fluent),height 420ms var(--ease-fluent);pointer-events:none;z-index:0}
+.nav-indicator::after{content:"";position:absolute;left:0;top:22%;bottom:22%;width:2px;border-radius:2px;background:var(--accent)}
+@media(max-width:640px){.nav-indicator::after{top:auto;left:24%;right:24%;bottom:0;width:auto;height:2px}}
+
+/* Acrylic dialogs */
+.confirm-dialog,.command-dialog{background:color-mix(in srgb,var(--bg),transparent 12%);backdrop-filter:blur(22px) saturate(140%);-webkit-backdrop-filter:blur(22px) saturate(140%)}
+.confirm-dialog[open]{animation:dialog-in 320ms var(--ease-fluent)}
+@keyframes dialog-in{from{opacity:0;transform:translateY(10px) scale(.97)}}
+.confirm-dialog[open]::backdrop{animation:backdrop-enter 260ms var(--ease-out)}
+
+/* Expanding commit lists */
+.commit-list{animation:unfold 360ms var(--ease-fluent);transform-origin:top}
+.commit-list li{animation:rise-in 380ms var(--ease-fluent) both}.commit-list li:nth-child(2){animation-delay:30ms}.commit-list li:nth-child(3){animation-delay:60ms}.commit-list li:nth-child(n+4){animation-delay:90ms}
+@keyframes unfold{from{opacity:0;clip-path:inset(0 0 100% 0 round 4px)}to{opacity:1;clip-path:inset(0 0 0 0 round 4px)}}
+
+/* Job progress: a rail under the phases fills as the deploy advances; the active phase shimmers. */
+.job-phases{position:relative;padding-bottom:9px}
+.job-phases::before,.job-phases::after{content:"";position:absolute;left:0;bottom:0;height:2px;border-radius:2px}
+.job-phases::before{right:0;background:var(--track)}
+.job-phases::after{width:calc(var(--progress,0)*100%);background:var(--accent);transition:width 600ms var(--ease-fluent)}
+.job-phases.is-rollback::after{background:var(--red)}
+.job-phases li{transition:color 300ms,background-color 300ms,border-color 300ms,opacity 300ms}
+.job-phases li.active{overflow:hidden}
+.job-phases li.active::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 30%,color-mix(in srgb,var(--accent-ink),transparent 70%) 50%,transparent 70%);transform:translateX(-100%);animation:shimmer 1.6s var(--ease-decel) infinite}
+@keyframes shimmer{to{transform:translateX(100%)}}
+.job-status svg,.job-status .dot{animation:pop 420ms var(--ease-fluent)}
+@keyframes pop{0%{transform:scale(.4);opacity:0}60%{transform:scale(1.15);opacity:1}to{transform:none}}
+
+/* Live log lines fade in as they arrive */
+.job-log.is-live>span:nth-last-child(-n+40){animation:readout-in 260ms var(--ease-decel)}
+
+/* Job chips breathe while work runs */
+.job-chip{position:relative;overflow:hidden}
+.job-chip::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 35%,var(--reveal) 50%,transparent 65%);transform:translateX(-100%);animation:shimmer 2.2s var(--ease-decel) infinite}
+
+/* State dots transition between colors rather than snapping */
+.dot{transition:background-color 400ms var(--ease-decel)}

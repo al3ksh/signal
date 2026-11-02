@@ -6,6 +6,7 @@
 - Added start, stop and restart for registered apps through the runner. Control is refused through the public tunnel, needs a same-origin request and a password step-up (10-minute grant), is rate-limited and is recorded in the journal. Ships a hardened `deploy/signal-runner.service`.
 - Added one-click update from the repository (fast-forward only, refused on a dirty or diverged checkout) with live job logs, a phase indicator, container and HTTP health checks and automatic rollback to the exact previous commit, reusing the previous images when they were saved. Added manual rollback, job history, job cancellation and command-palette entries for updating, restarting and opening job logs.
 - Faster updates: `pull` mode deploys CI-built images pinned to the deployed commit (`SIGNAL_COMMIT`), build mode rebuilds only services whose build context changed, a reusable arm64 GitHub Actions template (`docs/templates/build-arm64.yml`), and `deploy/update-signal.sh` for updating SIGNAL itself. See `docs/APP-CONTROL.md`.
+- Added a Fluent-style motion layer: pointer-tracked reveal light and edge glow, a sliding navigation indicator, acrylic dialogs, staggered card entrances, pressed states, a job progress rail with phase shimmer, and a decorative ambient signal field behind the interface. All of it respects reduced motion, the quiet motion setting, paused observation and hidden tabs.
 
 ## 2.2.0 — 2026-09-18
 
