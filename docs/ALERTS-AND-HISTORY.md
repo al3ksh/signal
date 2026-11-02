@@ -20,6 +20,13 @@ History starts at installation. Container logs and per-container CPU/RAM history
 | System disk usage at least 90% | 60 seconds | Below 87% |
 | Configured HTTP endpoint returns an error or cannot connect | 30 seconds | Successful HTTP 2xx/3xx response |
 | App control only: an app's last start/stop/restart/update/rollback job failed (critical) or was rolled back (warning) | Within 30 seconds of the job ending | The next job for that app succeeds; also suppressed by the app's maintenance window |
+| Raspberry Pi: under-voltage right now (`get_throttled` bit 0) | Immediately | Bit clears |
+| Raspberry Pi: any since-boot power/heat bit (16-19), "the PSU or cable may be too weak" (warning) | Immediately | Reboot clears the sticky bits |
+| ext4 error count on the root filesystem increased (critical) | Immediately | 7 days without a new error |
+| Root filesystem mounted read-only (critical) | Immediately | Mounted read-write |
+| NTP not synchronized (`/run/systemd/timesync/synchronized` missing; warning) | 10 minutes | Synchronized |
+| One or more failed systemd units (warning, names in the message) | Within 60 seconds | No failed units |
+| System disk full in under 14 days at the 7-day trend (warning) | Immediately | Forecast above 21 days or not filling |
 
 Detection is sampled, so opening can be delayed by one sample interval. An unavailable temperature does not create an alarm or falsely resolve an existing one. During a Docker outage, existing container incidents remain unchanged; an unreadable inventory does not mean every container disappeared.
 
@@ -50,3 +57,16 @@ This release records incidents in the panel only. It does not request browser no
 A future browser integration could notify while the page is open; delivery with the page closed requires Web Push infrastructure. Discord could receive incident/recovery messages through a private channel webhook. ntfy could send authenticated topic messages to a phone, using either a hosted or self-hosted service. These are possible extensions, not currently implemented settings.
 
 An application on the monitored server cannot report a total power or network outage after it loses connectivity. Use an independent external uptime monitor for that case. Alerts here are operational hints, not guaranteed paging or an incident-management service.
+
+## Raspberry health
+
+The overview's **Is the Raspberry OK?** card (`health.py`) shows one row per check, each with a reason, and "unavailable" whenever a value cannot be read; it never shows an unknown as OK.
+
+- **Power:** every `get_throttled` bit decoded, now (0-3) and since boot (16-19), plus core voltage. Read from the firmware sysfs file when present, otherwise `vcgencmd`, at most every 30 seconds.
+- **SD card:** ext4 `errors_count` and `lifetime_write_kbytes` from `/sys/fs/ext4/<device>/`, with a daily snapshot to show writes per day over the last week, and whether `/` is mounted read-only.
+- **Clock:** whether systemd-timesyncd reports NTP sync. Authenticator codes depend on it.
+- **Memory:** zram original and compressed size, swap use, major page faults per second, and PSI `avg60` only when the kernel provides `/proc/pressure`.
+- **Failed units:** `systemctl list-units --state=failed`, every 60 seconds, unprivileged.
+- **Disk:** a linear fit over the last 7 days of disk use (now stored with every history point) estimates "full in N days" when the disk is growing and N is under 60; inode use alongside.
+
+`vcgencmd` and `systemctl` run in a background thread on their own cadence, so they never delay the 5-second sample.

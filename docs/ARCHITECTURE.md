@@ -1,6 +1,6 @@
 # Architecture
 
-React/TypeScript renders a static Vite bundle. `server.py` serves that bundle, handles password sessions and collects Linux/Docker telemetry. The backend requires only Python's standard library. `storage.py` owns SQLite persistence; `alerts.py` owns debouncing, hysteresis and incident transitions.
+React/TypeScript renders a static Vite bundle. `server.py` serves that bundle, handles password sessions and collects Linux/Docker telemetry. The backend requires only Python's standard library. `storage.py` owns SQLite persistence; `alerts.py` owns debouncing, hysteresis and incident transitions. `health.py` reads Raspberry Pi health (power bits, SD card, clock, memory pressure, failed units, disk trend) from root-relative paths and caches its slow commands.
 
 ```text
 Browser -> HTTPS proxy -> SIGNAL HTTP server

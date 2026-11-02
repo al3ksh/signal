@@ -67,7 +67,7 @@ These steps assume the native install described in [INSTALLATION.md](INSTALLATIO
 1. **Update SIGNAL** (frontend and Python) from your workstation:
 
    ```sh
-   deploy/update-signal.sh alexpi@100.105.170.124
+   python deploy/deploy.py alexpi@100.105.170.124
    ```
 
 2. **Create the registry** from [`apps.example.json`](../apps.example.json). It already matches the host's table: `portfolio`, `discord-bot`, `tools`, `medium` with repositories; `ai-browser`, `lights-out`, `bread-power-dashboard` lifecycle-only. Check each `repo.branch` (assumed `main`), the compose file list (add `compose.landing-*.yml` for `discord-bot` if those belong to the same project) and the health URLs (only `portfolio` has one; the others rely on container state until you add one).
@@ -120,7 +120,7 @@ Out of the box both processes run as `alexpi`. If `alexpi` is in the `docker` gr
 
    ```sh
    sudo install -d -o alexpi -g alexpi -m 0755 /opt/signal
-   rsync -a /home/alexpi/apps/signal/ /opt/signal/      # code and dist/, later via SIGNAL_DEPLOY_DIR=/opt/signal deploy/update-signal.sh
+   sudo -u alexpi cp -a /home/alexpi/apps/signal/. /opt/signal/   # later: python deploy/deploy.py HOST --dir /opt/signal
    sudo install -o root -g signal -m 0640 /home/alexpi/.config/signal/access.json /etc/signal/access.json
    sudo chown -R signal:signal /var/lib/signal
    ```
@@ -228,7 +228,7 @@ Move Docker's data root to a USB 3 SSD (`"data-root"` in `/etc/docker/daemon.jso
 
 ### 5. SIGNAL itself
 
-SIGNAL is not Compose-managed on this host and the runner does not manage it. Use [`deploy/update-signal.sh`](../deploy/update-signal.sh) from a workstation or CI: it builds the frontend locally, keeps `dist-before-<timestamp>` backups on the Pi (last 5), syncs `dist/`, syncs Python files only when they changed, and restarts `signal.service` (or `signal-runner.service` for `runner.py`) only in that case. It prints the one-line rollback command for the frontend.
+SIGNAL is not Compose-managed on this host and the runner does not manage it. Deploy it with `python deploy/deploy.py HOST` from a workstation (see [INSTALLATION.md](INSTALLATION.md#deploy-to-a-native-install)): it builds locally, ships only what changed over ssh, restarts only the affected unit, verifies and rolls back by itself.
 
 ## Runner configuration
 

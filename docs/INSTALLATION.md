@@ -49,7 +49,56 @@ An existing installation can keep its old auth file by setting `SIGNAL_AUTH_FILE
 
 Before updating, run `sh ./signal backup` and keep the previous source revision or image tag. Update the source, then run `sh ./signal update`. The launcher rebuilds; it does not pull a repository or delete volumes. To roll back this version, restore the previous source and rebuild. A future database schema change may also require restoring the matching backup; review its release notes.
 
-For native installations, stop the service, back up the entire data directory, replace the application files and frontend together, and restart. Keep the access file and data directory outside the release files.
+For native installations, deploy with `deploy/deploy.py` (below). Keep the access file and data directory outside the release files; the deploy script never touches them.
+
+## Deploy to a native install
+
+`deploy/deploy.py` is the single supported way to update a native (systemd) install from a workstation. It needs Python 3, `ssh` and, unless you pass `--skip-build`, Node.js; it works from Windows Git Bash, Linux and macOS. The host needs `sh`, `tar`, `sha256sum`, `flock`, `curl` and `sudo` (all present on Raspberry Pi OS). There is no rsync or scp: everything is one tar stream over ssh.
+
+```sh
+python deploy/deploy.py alexpi@100.105.170.124              # build, test, ship what changed, restart what needs it, verify
+python deploy/deploy.py alexpi@100.105.170.124 --dry-run    # show what would change; touches nothing on the host
+python deploy/deploy.py alexpi@100.105.170.124 --list       # releases kept on the host
+python deploy/deploy.py alexpi@100.105.170.124 --rollback   # back to the state before the last deploy (run again to undo)
+```
+
+What a deploy does, in order:
+
+1. **Preflight (local):** refuses a dirty working tree (`--allow-dirty`), runs `npm run build` (`--skip-build`) and `python -m unittest -q` (`--skip-tests`). What ships is derived from the files: every non-test `*.py` at the repository root plus `dist/`.
+2. **Lock:** `flock` on `<dir>/.deploy.lock` for the whole session, so two deploys cannot overlap.
+3. **Diff:** one `sha256sum` pass on the host decides what changed. A frontend change needs no restart; `runner.py` restarts only `signal-runner.service`; `setup_access.py`/`setup_2fa.py` restart nothing; any other module restarts `signal.service`. Before changing anything it checks `sudo -n -l systemctl restart <unit>`; if sudo would prompt, it stops and prints the sudoers line or the command to run by hand.
+4. **Snapshot:** `releases/<UTC stamp>/` gets the host's current `dist/`, all its Python files and a `manifest.json`. The newest 5 are kept.
+5. **Upload and swap:** a tar into `releases/<stamp>.incoming/`, hashes checked on the host, then `dist/` is swapped by rename and Python files are installed with `install -m 644`.
+6. **Restart and verify:** only the affected units, then `/healthz` must answer within 30 s (`--verify-seconds`), the served `index.html` must reference the new `assets/index-*.js`, and restarted units must be `active`.
+7. **Automatic rollback:** if verification fails, the snapshot is restored, the units restarted and verified again, and the script exits non-zero saying which state is running.
+
+`--rollback [STAMP]` restores a snapshot (default: the newest) after taking a fresh snapshot of the current state, so running it twice returns to where you were. `--prune-legacy` additionally lists the old `dist-before-*`, `backend-before-*` and `release-*` directories with their sizes and deletes them after you confirm. `--dir` (or `SIGNAL_DEPLOY_DIR`) changes the install directory, default `/home/alexpi/apps/signal`.
+
+To let restarts run without a password prompt, add a sudoers drop-in on the host (`sudo visudo -f /etc/sudoers.d/signal-deploy`):
+
+```text
+alexpi ALL=(root) NOPASSWD: /usr/bin/systemctl restart signal.service, /usr/bin/systemctl restart signal-runner.service
+```
+
+`deploy/update-signal.sh` remains as a thin wrapper around `deploy.py`.
+
+## Free disk space on the Pi
+
+`deploy/pi-clean.py` finds what can be removed and decides per item, never wholesale. Copy it to the Pi once (it is not part of a SIGNAL deploy) and run it there:
+
+```sh
+ssh alexpi@100.105.170.124 'cat > ~/pi-clean.py' < deploy/pi-clean.py
+ssh -t alexpi@100.105.170.124 sudo python3 pi-clean.py            # scan: report only, changes nothing
+ssh -t alexpi@100.105.170.124 sudo python3 pi-clean.py apply      # asks y / each / N per group
+```
+
+Every finding has a size, an age, a safety level and the exact action:
+
+- **safe:** Docker build cache, dangling `<none>` images, journal above 100 MB, atop logs older than 7 days, the apt package cache, SIGNAL deploy backups beyond the newest five and `__pycache__` under `~/apps`. `apply --safe` applies only these, printing each first.
+- **review:** images that no container (running or stopped) and no registered app's compose file uses, with `:signal-prev` rollback images of existing apps excluded; stopped containers older than 14 days with the image space they pin (a Compose project whose containers are all stopped is removed with `docker compose -p <project> down`, volumes kept); and the persistent config changes (journald `SystemMaxUse=100M`, atop `LOGGENERATIONS=7`), which are always separate items.
+- **report-only:** `~/backups` and `~/apps/*backup*`, dangling volumes, and the 15 largest other files over 100 MB. The tool never removes these.
+
+It never runs `docker system prune`, `docker image prune -a` or `docker volume prune`, and it ignores `docker system df`, whose reclaimable figure is wrong with the containerd image store. Each item is re-checked just before it is applied and skipped if it no longer qualifies; every action is logged with the space freed to `/var/log/pi-clean.log`. `--json` prints the scan for scripts.
 
 ## Backup and restore
 

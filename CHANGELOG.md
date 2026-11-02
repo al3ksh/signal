@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added `deploy/pi-clean.py`, a semi-automatic disk cleaner for the Pi. Scan is the default and changes nothing; `apply` asks per group or item and `apply --safe` applies only safe items. Unused images are computed from real container and compose references (never `docker system df`), `:signal-prev` rollback images and registered apps' images are kept, stopped containers show the image space they pin, volumes and personal backups are only reported, each item is re-checked before it runs, and actions are logged to `/var/log/pi-clean.log`.
+
+- Added Raspberry Pi health: all `get_throttled` bits decoded (now and since boot) with core voltage, SD card ext4 errors and writes per day, read-only root detection, inodes, NTP sync, zram/swap/major faults (PSI when available), failed systemd units and a 7-day "disk full in N days" forecast. Shown in an overview card and on the temperature card, with incidents for under-voltage, power history, SD errors, read-only root, clock, failed units and the disk forecast. Disk use is now part of the history.
+
+- Added `deploy/deploy.py`, a stdlib deploy script that needs only ssh (works from Windows Git Bash): it ships only what changed, restarts only the affected unit, verifies `/healthz`, the served assets and unit state, rolls back by itself, keeps five `releases/<stamp>/` snapshots, supports `--dry-run`, `--list`, `--rollback` and `--prune-legacy`, and refuses to start if sudo would prompt. `update-signal.sh` is now a wrapper around it.
+
 - Added an optional app registry and a separate runner (`runner.py`) that reports each Compose app's deployed commit and how many commits it is behind its repository branch. A new Apps view appears only when `SIGNAL_CONTROL_SOCKET` is set and the runner is reachable.
 - Added start, stop and restart for registered apps through the runner. Control is refused through the public tunnel, needs a same-origin request and a password step-up (10-minute grant), is rate-limited and is recorded in the journal. Ships a hardened `deploy/signal-runner.service`.
 - Added one-click update from the repository (fast-forward only, refused on a dirty or diverged checkout) with live job logs, a phase indicator, container and HTTP health checks and automatic rollback to the exact previous commit, reusing the previous images when they were saved. Added manual rollback, job history, job cancellation and command-palette entries for updating, restarting and opening job logs.

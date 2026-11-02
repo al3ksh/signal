@@ -20,6 +20,7 @@ Native-only/path settings (fixed to container mount paths in the supplied Compos
 | `SIGNAL_AUTH_FILE` | `$SIGNAL_DATA_DIR/access.json` | Password hash and signing secret. |
 | `SIGNAL_PROC_ROOT` | `/proc` | Host process and memory counters. |
 | `SIGNAL_SYS_ROOT` | `/sys` | Optional thermal and frequency counters. |
+| `SIGNAL_RUN_ROOT` | `/run` | Where to look for `systemd/timesync/synchronized` (clock sync). |
 | `SIGNAL_DISK_PATH` | `/` | Filesystem whose capacity is reported. |
 | `SIGNAL_PUBLIC_MODE` | Off | Explicit unauthenticated telemetry mode when no auth file exists. Not recommended; logs and alert acknowledgement remain disabled. |
 
