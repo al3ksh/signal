@@ -55,6 +55,10 @@ CONTROL_2FA_FILE = Path(os.getenv('SIGNAL_CONTROL_2FA_FILE', str(DATA_DIR / 'con
 CONTROL_2FA_LOCK = threading.Lock()
 CONTROL_2FA_USED = {}
 PUBLIC_STEP_UP_LIMIT = 10  # failed public step-ups per minute across every address
+# Disk cleanup: a root daemon (deploy/pi-clean.py serve) that only scans and applies its own findings by id.
+CLEAN_SOCKET = os.getenv('SIGNAL_CLEAN_SOCKET', '/run/pi-clean/control.sock') or None
+CLEAN_RATE = {}
+CLEAN_LOCK = threading.Lock()
 
 
 def make_session(expiry=None):
@@ -84,17 +88,33 @@ def control_call(request, timeout=8):
     """One newline-delimited JSON request to the runner. Only fixed ops and validated values are sent."""
     if not CONTROL_SOCKET:
         raise ControlError('App control is not configured.')
+    return unix_call(CONTROL_SOCKET, request, timeout, 'The app runner')
+
+
+def clean_call(request, timeout=120):
+    """The same protocol to the root cleanup daemon. One request at a time: it runs them one at a time anyway."""
+    if not CLEAN_SOCKET:
+        raise ControlError('Disk cleanup is not configured.')
+    if not CLEAN_LOCK.acquire(timeout=1):
+        raise ControlError('Another cleanup request is running. Try again when it finishes.', 'conflict')
+    try:
+        return unix_call(CLEAN_SOCKET, request, timeout, 'The cleanup service')
+    finally:
+        CLEAN_LOCK.release()
+
+
+def unix_call(path, request, timeout, name):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
-            sock.connect(CONTROL_SOCKET)
+            sock.connect(path)
             sock.sendall(json.dumps(request).encode() + b'\n')
             line = sock.makefile('rb').readline(4 * 1024 * 1024)
         response = json.loads(line)
     except (OSError, ValueError) as exc:
-        raise ControlError('The app runner is not reachable.') from exc
+        raise ControlError(name + ' is not reachable.') from exc
     if not isinstance(response, dict) or not response.get('ok'):
-        raise ControlError(str((response or {}).get('error') or 'The runner refused the request.')[:300], (response or {}).get('code', 'invalid'))
+        raise ControlError(str((response or {}).get('error') or name + ' refused the request.')[:300], (response or {}).get('code', 'invalid'))
     return response
 
 
@@ -572,6 +592,8 @@ class Handler(BaseHTTPRequestHandler):
         if origin and urlparse(origin).netloc != self.headers.get('Host'):
             if re.fullmatch(r'/api/apps/[a-z0-9-]{1,40}/[a-z]+|/api/jobs/[a-f0-9]{32}/cancel', path) and CONTROL_SOCKET:
                 self.audit(path.split('/')[3][:40], path.rsplit('/', 1)[1][:12], 'refused', 'Cross-origin request.')
+            elif path == '/api/cleanup/apply' and CLEAN_SOCKET:
+                self.audit('pi-clean', 'cleanup', 'refused', 'Cross-origin request.')
             return self.json(403, {'error': 'Request origin is not allowed.'})
         match = re.fullmatch(r'/api/apps/([a-z0-9-]{1,40})/([a-z]+)', path)
         if match and match[2] in CONTROL_ACTIONS:
@@ -579,6 +601,8 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/cancel', path)
         if match:
             return self.control_post(None, 'cancel', match[1])
+        if path == '/api/cleanup/apply':
+            return self.cleanup_post()
         if path == '/api/logout':
             self.cookie('', 0)
             return self.json(200, {'ok': True})
@@ -714,6 +738,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(401, {'error': 'Sign in to view system data.'})
         if path.startswith(('/api/apps', '/api/jobs/')):
             return self.control_get(path, parse_qs(parsed.query))
+        if path == '/api/cleanup':
+            return self.cleanup_get(parse_qs(parsed.query))
         if path == '/api/history':
             ranges = {'1h': 3600, '24h': 86400, '7d': 604800}
             value = parse_qs(parsed.query).get('range', ['24h'])[0]
@@ -792,58 +818,81 @@ class Handler(BaseHTTPRequestHandler):
                 table[key] = recent + [now]
             return False
 
+    def control_refuse(self, name, action, code, message, **extra):
+        self.audit(name, action, 'refused', message)
+        return self.json(code, {'error': message, **extra})
+
+    def control_preflight(self, name, action):
+        """Rate, session, network, same-origin JSON. Returns the request body, or None once a refusal was sent."""
+        if self.limited(CONTROL_RATE, self.client_key(), CONTROL_RATE_LIMIT):
+            print('Control: rate limited', action, name, 'from', self.client_key(), flush=True)
+            self.json(429, {'error': 'Too many control requests. Try again in a minute.'})
+            return None
+        if not AUTH or not self.authenticated():
+            self.control_refuse(name, action, 401, 'A private session is required.')
+            return None
+        if not self.control_network_allowed():
+            self.control_refuse(name, action, 403, 'App control is available over Tailscale or on the host, not through the public address.')
+            return None
+        origin, fetch_site = self.headers.get('Origin') or '', self.headers.get('Sec-Fetch-Site') or ''
+        same_origin = urlparse(origin).netloc == self.headers.get('Host') if origin else fetch_site == 'same-origin'
+        if not same_origin or not (self.headers.get('Content-Type') or '').startswith('application/json'):
+            self.control_refuse(name, action, 403, 'Same-origin JSON request required.')
+            return None
+        try:
+            return self.request_json() if int(self.headers.get('Content-Length') or 0) else {}
+        except (ValueError, json.JSONDecodeError):
+            self.json(400, {'error': 'Invalid request.'})
+            return None
+
+    def control_step_up(self, name, action, body):
+        """A valid grant cookie, or the password (plus an authenticator code through the public address), which
+        mints one for 10 minutes. Returns False once a refusal was sent."""
+        session, public = self.cookie_value('signal_session'), self.via_tunnel()
+        if valid_control_grant(self.cookie_value('signal_control'), session, self.grant_scope()):
+            return True
+        def refuse(code, message):
+            self.control_refuse(name, action, code, message, stepUp=True, secondFactor=public)
+            return False
+        password, code = body.get('password'), body.get('code')
+        # Public addresses are cheap to rotate, so public failures also share one budget.
+        if (self.limited(CONTROL_ATTEMPTS, self.client_key(), 5, record=False)
+                or public and self.limited(CONTROL_ATTEMPTS, 'public', PUBLIC_STEP_UP_LIMIT, record=False)):
+            self.control_refuse(name, action, 429, 'Too many password attempts. Try again in a minute.')
+            return False
+        if not isinstance(password, str) or not password or public and (not isinstance(code, str) or not code):
+            return refuse(403, 'Confirm with your access password and authenticator code.' if public else 'Confirm with your access password.')
+        def failed(message):
+            self.limited(CONTROL_ATTEMPTS, self.client_key(), 5)
+            if public:
+                self.limited(CONTROL_ATTEMPTS, 'public', PUBLIC_STEP_UP_LIMIT)
+            return refuse(403, message)
+        digest = hashlib.pbkdf2_hmac('sha256', password[:1024].encode(), bytes.fromhex(AUTH['salt']), AUTH['iterations']).hex()
+        if not hmac.compare_digest(digest, AUTH['hash']):
+            return failed('Incorrect password.')
+        if public and not verify_second_factor(code):
+            return failed('Incorrect or already used authenticator code.')
+        with AUTH_LOCK:
+            CONTROL_ATTEMPTS.pop(self.client_key(), None)
+        secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
+        self.cookie_header = ('signal_control=' + make_control_grant(session, scope=self.grant_scope()) + '; Path=/; HttpOnly; SameSite=Strict; Max-Age='
+                              + str(CONTROL_GRANT_SECONDS) + secure)
+        return True
+
     def control_post(self, app_id, action, job_id=None):
         """Gate order: configured, rate, session, network, same-origin, registry, step-up (password, plus an
         authenticator code through the public address). Only {app, action} reach the runner."""
         if not CONTROL_SOCKET:
             return self.json(404, {'error': 'Unknown endpoint.'})
         name = app_id or job_id[:12]
-        def refuse(code, message, **extra):
-            self.audit(name, action, 'refused', message)
-            return self.json(code, {'error': message, **extra})
-        if self.limited(CONTROL_RATE, self.client_key(), CONTROL_RATE_LIMIT):
-            print('Control: rate limited', action, name, 'from', self.client_key(), flush=True)
-            return self.json(429, {'error': 'Too many control requests. Try again in a minute.'})
-        if not AUTH or not self.authenticated():
-            return refuse(401, 'A private session is required.')
-        if not self.control_network_allowed():
-            return refuse(403, 'App control is available over Tailscale or on the host, not through the public address.')
-        origin, fetch_site = self.headers.get('Origin') or '', self.headers.get('Sec-Fetch-Site') or ''
-        same_origin = urlparse(origin).netloc == self.headers.get('Host') if origin else fetch_site == 'same-origin'
-        if not same_origin or not (self.headers.get('Content-Type') or '').startswith('application/json'):
-            return refuse(403, 'Same-origin JSON request required.')
-        try:
-            body = self.request_json() if int(self.headers.get('Content-Length') or 0) else {}
-        except (ValueError, json.JSONDecodeError):
-            return self.json(400, {'error': 'Invalid request.'})
+        body = self.control_preflight(name, action)
+        if body is None:
+            return None
         try:
             if app_id is not None and app_id not in {app.get('id') for app in control_call({'op': 'list'})['apps']}:
-                return refuse(404, 'Unknown app.')
-            session, public = self.cookie_value('signal_session'), self.via_tunnel()
-            if action != 'check' and not valid_control_grant(self.cookie_value('signal_control'), session, self.grant_scope()):
-                password, code = body.get('password'), body.get('code')
-                # Public addresses are cheap to rotate, so public failures also share one budget.
-                if (self.limited(CONTROL_ATTEMPTS, self.client_key(), 5, record=False)
-                        or public and self.limited(CONTROL_ATTEMPTS, 'public', PUBLIC_STEP_UP_LIMIT, record=False)):
-                    return refuse(429, 'Too many password attempts. Try again in a minute.')
-                if not isinstance(password, str) or not password or public and (not isinstance(code, str) or not code):
-                    message = 'Confirm with your access password and authenticator code.' if public else 'Confirm with your access password.'
-                    return refuse(403, message, stepUp=True, secondFactor=public)
-                def failed(message):
-                    self.limited(CONTROL_ATTEMPTS, self.client_key(), 5)
-                    if public:
-                        self.limited(CONTROL_ATTEMPTS, 'public', PUBLIC_STEP_UP_LIMIT)
-                    return refuse(403, message, stepUp=True, secondFactor=public)
-                digest = hashlib.pbkdf2_hmac('sha256', password[:1024].encode(), bytes.fromhex(AUTH['salt']), AUTH['iterations']).hex()
-                if not hmac.compare_digest(digest, AUTH['hash']):
-                    return failed('Incorrect password.')
-                if public and not verify_second_factor(code):
-                    return failed('Incorrect or already used authenticator code.')
-                with AUTH_LOCK:
-                    CONTROL_ATTEMPTS.pop(self.client_key(), None)
-                secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
-                self.cookie_header = ('signal_control=' + make_control_grant(session, scope=self.grant_scope()) + '; Path=/; HttpOnly; SameSite=Strict; Max-Age='
-                                      + str(CONTROL_GRANT_SECONDS) + secure)
+                return self.control_refuse(name, action, 404, 'Unknown app.')
+            if action != 'check' and not self.control_step_up(name, action, body):
+                return None
             if job_id:
                 result = control_call({'op': 'cancel', 'id': job_id})
                 self.audit(name, action, 'accepted', 'Cancel requested.')
@@ -851,9 +900,49 @@ class Handler(BaseHTTPRequestHandler):
             result = control_call({'op': 'run', 'app': app_id, 'action': action, 'actor': 'session@' + self.client_key()})
         except ControlError as exc:
             code = {'not_found': 404, 'conflict': 409, 'unavailable': 503}.get(exc.code, 400)
-            return refuse(code, str(exc))
+            return self.control_refuse(name, action, code, str(exc))
         self.audit(name, action, 'accepted', 'Job ' + str(result['job'].get('id', ''))[:12] + ' queued.')
         return self.json(202, result)
+
+    def cleanup_state(self):
+        """Who may apply cleanup from here: the app-control network and step-up rules, without needing the runner."""
+        return self.control_state(True)
+
+    def cleanup_post(self):
+        """Apply one cleanup finding by id: the app-control gate and step-up, then the root daemon re-checks the
+        item against its own scan. The id is the only thing that leaves SIGNAL."""
+        if not CLEAN_SOCKET:
+            return self.json(404, {'error': 'Unknown endpoint.'})
+        body = self.control_preflight('pi-clean', 'cleanup')
+        if body is None:
+            return None
+        item = body.get('id')
+        if not isinstance(item, str) or not 0 < len(item) <= 512:
+            return self.json(400, {'error': 'Invalid request.'})
+        if not self.control_step_up('pi-clean', 'cleanup', body):
+            return None
+        try:
+            result = clean_call({'op': 'apply', 'id': item}, timeout=600)
+        except ControlError as exc:
+            code = {'not_found': 404, 'conflict': 409}.get(exc.code, 503)
+            return self.control_refuse('pi-clean', 'cleanup', code, str(exc))
+        result.pop('ok', None)
+        outcome = 'Applied ' if result.get('applied') else 'Skipped '
+        self.audit('pi-clean', 'cleanup', 'accepted', outcome + item[:120] + ', ' + str(result.get('freed', 0)) + ' bytes freed.')
+        return self.json(200, result)
+
+    def cleanup_get(self, query):
+        if not CLEAN_SOCKET:
+            return self.json(404, {'error': 'Unknown endpoint.'})
+        refresh = query.get('refresh', ['0'])[0] == '1'
+        if refresh and self.limited(CLEAN_RATE, self.client_key(), 6):
+            return self.json(429, {'error': 'Too many rescans. Try again in a minute.'})
+        try:
+            result = clean_call({'op': 'scan', 'refresh': refresh})
+        except ControlError as exc:
+            return self.json(409 if exc.code == 'conflict' else 503, {'error': str(exc)})
+        result.pop('ok', None)
+        return self.json(200, {**result, 'control': self.cleanup_state()})
 
     def control_get(self, path, query):
         if not CONTROL_SOCKET:

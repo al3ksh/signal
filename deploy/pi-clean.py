@@ -5,6 +5,7 @@
     sudo python3 pi-clean.py --json          the same, machine-readable
     sudo python3 pi-clean.py apply           interactive: asks y/N per group, or per item
     sudo python3 pi-clean.py apply --safe    applies only items marked safe, printing each first
+    pi-clean serve --home /home/alexpi       root daemon behind SIGNAL's cleanup card (pi-clean.service)
 
 It automates the manual routine (df, du, docker images/ps, journal, atop, apt cache, deploy leftovers) but decides
 per item and never wholesale: no `docker system prune`, no `image prune -a`, no volume pruning, and nothing under a
@@ -13,12 +14,14 @@ user's data directories. "Reclaimable" is computed from real container-to-image 
 """
 import argparse
 import datetime
+import grp
 import json
 import os
 from pathlib import Path
 import pwd
 import re
 import shutil
+import socketserver
 import subprocess
 import sys
 import time
@@ -402,6 +405,77 @@ class Applier:
             pass
 
 
+class Service:
+    """The root side of SIGNAL's cleanup card. Only two requests exist: scan, and apply one finding by id. The id is
+    looked up in this daemon's own scan, so a client never supplies a command or a path, and report-only items stay
+    untouchable here too."""
+    def __init__(self, make_scanner, max_age=900, clock=time.time):
+        self.make_scanner, self.max_age, self.clock, self.cache = make_scanner, max_age, clock, None
+
+    def scan(self, refresh=False):
+        if refresh or self.cache is None or self.clock() - self.cache['scannedAt'] > self.max_age:
+            scanner = self.make_scanner()
+            free = shutil.disk_usage(scanner.root).free
+            self.cache = {'scannedAt': self.clock(), 'free': free, 'findings': scanner.scan()}
+        return self.cache
+
+    def apply(self, id):
+        item = next((f for f in self.scan()['findings'] if f['id'] == id), None)
+        if item is None or item['safety'] == REPORT or not item['action']:
+            return {'ok': False, 'code': 'not_found', 'error': 'No cleanable item with that id. Rescan and try again.'}
+        lines = []
+        scanner = self.make_scanner()
+        before = shutil.disk_usage(scanner.root).free
+        applied = Applier(scanner, lines.append).apply(item)
+        free = shutil.disk_usage(scanner.root).free
+        # The item is done (or no longer applies) either way; the rest of the cached scan stays valid until a refresh.
+        self.cache['findings'] = [f for f in self.cache['findings'] if f['id'] != id]
+        self.cache['free'] = free
+        return {'ok': True, 'applied': applied, 'id': id, 'title': item['title'], 'freed': max(0, free - before), 'free': free, 'log': lines}
+
+    def handle(self, request):
+        if not isinstance(request, dict):
+            return {'ok': False, 'code': 'invalid', 'error': 'Invalid request.'}
+        if request.get('op') == 'scan':
+            return {'ok': True, **self.scan(bool(request.get('refresh')))}
+        if request.get('op') == 'apply' and isinstance(request.get('id'), str) and 0 < len(request['id']) <= 512:
+            return self.apply(request['id'])
+        return {'ok': False, 'code': 'invalid', 'error': 'Invalid request.'}
+
+
+def make_server(service, path, group=None):
+    """One request at a time over a unix socket: newline-delimited JSON in, one JSON line out."""
+    class Handler(socketserver.StreamRequestHandler):
+        timeout = 10
+
+        def handle(self):
+            try:
+                line = self.rfile.readline(4096)
+                request = json.loads(line) if line.endswith(b'\n') else None
+            except (OSError, ValueError):
+                request = None
+            self.request.settimeout(None)  # applying can take minutes; the reply must still arrive
+            try:
+                response = service.handle(request)
+            except Exception as exc:  # one broken scanner must not take the daemon down
+                response = {'ok': False, 'code': 'failed', 'error': f'{type(exc).__name__}: {exc}'[:300]}
+            self.wfile.write(json.dumps(response).encode() + b'\n')
+
+    if os.path.exists(path):
+        os.unlink(path)
+    server = socketserver.UnixStreamServer(path, Handler)
+    os.chmod(path, 0o660)
+    if group:
+        os.chown(path, 0, grp.getgrnam(group).gr_gid)
+    return server
+
+
+def serve(service, path, group=None):
+    server = make_server(service, path, group)
+    print(f'pi-clean: serving on {path}', flush=True)
+    server.serve_forever()
+
+
 def report(findings, out=print):
     total = {level: sum(f['bytes'] or 0 for f in findings if f['safety'] == level) for level in (SAFE, REVIEW, REPORT)}
     out(f"Safe to clean: {human(total[SAFE])} · needs review: {human(total[REVIEW])} · report only: {human(total[REPORT])}")
@@ -418,13 +492,18 @@ def report(findings, out=print):
 
 def main(argv=None, scanner=None, out=print, ask=input):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', nargs='?', choices=['scan', 'apply'], default='scan')
+    parser.add_argument('mode', nargs='?', choices=['scan', 'apply', 'serve'], default='scan')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--safe', action='store_true', help='with apply: only items marked safe, no questions')
     parser.add_argument('--home', help='home whose ~/apps and ~/backups are scanned (default: the sudo user)')
     parser.add_argument('--signal-dir', help='SIGNAL install dir (default ~/apps/signal)')
     parser.add_argument('--registry', default='/etc/signal/apps.json')
+    parser.add_argument('--socket', default='/run/pi-clean/control.sock', help='with serve: where SIGNAL connects')
+    parser.add_argument('--group', help='with serve: group allowed to connect (the user SIGNAL runs as)')
     args = parser.parse_args(argv)
+    if args.mode == 'serve':
+        serve(Service(lambda: scanner or Scanner(home=args.home, signal_dir=args.signal_dir, registry=args.registry)), args.socket, args.group)
+        return 0
     scanner = scanner or Scanner(home=args.home, signal_dir=args.signal_dir, registry=args.registry)
     before = shutil.disk_usage(scanner.root).free
     findings = scanner.scan()

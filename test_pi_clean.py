@@ -228,6 +228,53 @@ class CleanerTests(unittest.TestCase):
         for path in ['/home/alexpi/apps/signal', '/home/alexpi/data', '/var/log/atop', '/home/alexpi/apps/signal/../data', '/etc/passwd']:
             self.assertFalse(applier.deletable(path), path)
 
+    def test_service_applies_only_its_own_findings(self):
+        clock = [1000.0]
+        service = clean.Service(self.scanner, clock=lambda: clock[0])
+        scan = service.handle({'op': 'scan'})
+        self.assertTrue(scan['ok'])
+        self.assertEqual(self.docker.mutations(), [])
+        calls = len(self.docker.calls)
+        service.handle({'op': 'scan'})
+        self.assertEqual(len(self.docker.calls), calls)  # cached
+        clock[0] += 901
+        service.handle({'op': 'scan'})
+        self.assertGreater(len(self.docker.calls), calls)  # stale cache rescans
+        for bad in [None, [], {'op': 'run', 'argv': ['rm', '-rf', '/']}, {'op': 'apply'}, {'op': 'apply', 'id': 'x' * 513},
+                    {'op': 'apply', 'id': 'nope'}, {'op': 'apply', 'id': 'backup:backups/photos.tar'}, {'op': 'apply', 'id': 'volume:medium_old_data'}]:
+            self.assertFalse(service.handle(bad)['ok'], bad)
+        self.assertEqual(self.docker.mutations(), [])
+        self.assertTrue((self.root / 'home/alexpi/backups/photos.tar').exists())
+        # A forged action in the request is ignored: only the daemon's own finding runs.
+        result = service.handle({'op': 'apply', 'id': 'apt', 'action': [{'argv': ['rm', '-rf', '/']}]})
+        self.assertTrue(result['ok'] and result['applied'])
+        self.assertEqual(self.docker.mutations(), [['apt-get', 'clean']])
+        self.assertIn('  $ apt-get clean', result['log'])
+        self.assertNotIn('apt', {f['id'] for f in service.handle({'op': 'scan'})['findings']})
+        result = service.handle({'op': 'apply', 'id': 'atop'})
+        self.assertTrue(result['applied'])
+        self.assertFalse((self.root / 'var/log/atop/atop_20260901').exists())
+
+    def test_socket_round_trip(self):
+        import socket
+        import threading
+        path = str(self.root / 'clean.sock')
+        server = clean.make_server(clean.Service(self.scanner), path)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o660)
+        def call(raw):
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.connect(path)
+                sock.sendall(raw)
+                sock.shutdown(socket.SHUT_WR)
+                return json.loads(sock.makefile('rb').readline())
+        self.assertTrue(call(b'{"op": "scan"}\n')['findings'])
+        self.assertFalse(call(b'not json\n')['ok'])
+        self.assertFalse(call(b'{"op": "scan"}')['ok'])  # no newline: rejected, not hung
+        self.assertEqual(self.docker.mutations(), [])
+
     def test_parse_size(self):
         self.assertEqual(clean.parse_size('121.0M'), int(121 * 1024 ** 2))
         self.assertEqual(clean.parse_size('4.5GB'), int(4.5 * GB))

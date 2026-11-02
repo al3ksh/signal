@@ -1,0 +1,21 @@
+# Root daemon behind SIGNAL's Disk cleanup card. It scans and applies only its own findings, by id; SIGNAL (group
+# alexpi) reaches it over /run/pi-clean/control.sock after the app-control password (+ authenticator) step-up.
+#   sudo install -m 0755 deploy/pi-clean.py /usr/local/bin/pi-clean
+#   sudo install -m 0644 deploy/pi-clean.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pi-clean
+[Unit]
+Description=pi-clean disk cleanup daemon for SIGNAL
+After=docker.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/pi-clean serve --home /home/alexpi --group alexpi
+RuntimeDirectory=pi-clean
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -55,6 +55,13 @@ class FakeRunner(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             return {'ok': True, 'data': 'line\n', 'offset': request['offset'] + 5, 'done': False}
         if op == 'cancel':
             return {'ok': True, 'job': {'id': request['id'], 'status': 'cancelled'}}
+        # The same fake also plays the root cleanup daemon (pi-clean serve).
+        if op == 'scan':
+            return {'ok': True, 'scannedAt': 1, 'free': 5, 'findings': [{'id': 'apt', 'safety': 'safe', 'bytes': 3}]}
+        if op == 'apply':
+            if request.get('id') != 'apt':
+                return {'ok': False, 'code': 'not_found', 'error': 'No cleanable item with that id. Rescan and try again.'}
+            return {'ok': True, 'applied': True, 'id': 'apt', 'freed': 3, 'free': 8, 'log': ['  $ apt-get clean']}
         return {'ok': False, 'code': 'invalid', 'error': 'Unknown operation.'}
 
 
@@ -96,6 +103,10 @@ class ControlTests(unittest.TestCase):
         enabled = patch.object(server, 'CONTROL_SOCKET', self.socket)
         enabled.start()
         self.addCleanup(enabled.stop)
+        cleaner = patch.object(server, 'CLEAN_SOCKET', self.socket)
+        cleaner.start()
+        self.addCleanup(cleaner.stop)
+        server.CLEAN_RATE.clear()
         self.totp_file = os.path.join(self.tmp.name, 'control-2fa.json')
         if os.path.exists(self.totp_file):
             os.unlink(self.totp_file)
@@ -346,6 +357,58 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.get('/api/jobs/not-a-job').status, 404)
         self.assertEqual(self.get('/api/apps/nope/jobs').status, 404)
         self.assertEqual(self.post('/api/jobs/' + job + '/cancel', password='test-password').status, 200)
+
+    # -- disk cleanup ----------------------------------------------------------------
+    def applies(self):
+        return [r for r in self.runner.requests if r.get('op') == 'apply']
+
+    def test_cleanup_scan_needs_a_session_and_reports_control(self):
+        self.assertEqual(self.request('/api/cleanup').status, 401)
+        data = json.loads(self.get('/api/cleanup').body)
+        self.assertEqual((data['free'], data['findings'][0]['id']), (5, 'apt'))
+        self.assertEqual(data['control'], {'available': True, 'allowed': True, 'granted': False, 'secondFactor': False})
+        self.assertFalse(json.loads(self.get('/api/cleanup', **self.TUNNEL).body)['control']['allowed'])
+        self.get('/api/cleanup?refresh=1')
+        self.assertEqual([r for r in self.runner.requests if r['op'] == 'scan'], [{'op': 'scan', 'refresh': False}] * 2 + [{'op': 'scan', 'refresh': True}])
+        for _ in range(6):
+            self.get('/api/cleanup?refresh=1')
+        self.assertEqual(self.get('/api/cleanup?refresh=1').status, 429)
+        self.assertEqual(self.get('/api/cleanup').status, 200)  # cached reads stay open
+        with patch.object(server, 'CLEAN_SOCKET', os.path.join(self.tmp.name, 'missing.sock')):
+            self.assertEqual(self.get('/api/cleanup').status, 503)
+        with patch.object(server, 'CLEAN_SOCKET', None):
+            self.assertEqual(self.get('/api/cleanup').status, 404)
+            self.assertEqual(self.post('/api/cleanup/apply', {'id': 'apt'}, password='test-password').status, 404)
+
+    def test_cleanup_apply_uses_the_control_gate(self):
+        self.assertEqual(self.request('/api/cleanup/apply', 'POST', {'id': 'apt', 'password': 'test-password'},
+                                      {'Origin': 'http://' + self.host, 'Content-Type': 'application/json'}).status, 401)
+        self.assertEqual(self.post('/api/cleanup/apply', {'id': 'apt'}, password='test-password', Origin='https://evil.example').status, 403)
+        self.assertEqual(self.post('/api/cleanup/apply', {'id': 'apt'}, password='test-password', **self.TUNNEL).status, 403)  # no authenticator
+        response = self.post('/api/cleanup/apply', {'id': 'apt'})
+        self.assertEqual(response.status, 403)
+        self.assertTrue(json.loads(response.body)['stepUp'])
+        self.assertEqual(self.post('/api/cleanup/apply', {'id': 'apt'}, password='wrong').status, 403)
+        for bad in [{}, {'id': ''}, {'id': 7}, {'id': 'x' * 513}]:
+            self.assertEqual(self.post('/api/cleanup/apply', bad, password='test-password').status, 400, bad)
+        self.assertEqual(self.applies(), [])
+        response = self.post('/api/cleanup/apply', {'id': 'apt', 'action': [{'argv': ['rm', '-rf', '/']}]}, password='test-password')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.body)['freed'], 3)
+        self.assertEqual(self.applies(), [{'op': 'apply', 'id': 'apt'}])  # only the id leaves SIGNAL
+        both = self.session + '; ' + response.headers['Set-Cookie'].split(';')[0]
+        self.assertEqual(self.post('/api/cleanup/apply', {'id': 'backup:x'}, Cookie=both).status, 404)
+        events = [(e['name'], e['state'], e['outcome']) for e in self.control_events()]
+        self.assertIn(('pi-clean', 'cleanup', 'accepted'), events)
+
+    def test_public_cleanup_needs_the_authenticator(self):
+        secret, _ = self.enroll()
+        response = self.post('/api/cleanup/apply', {'id': 'apt'}, password='test-password', **self.TUNNEL)
+        self.assertEqual(response.status, 403)
+        self.assertTrue(json.loads(response.body)['secondFactor'])
+        self.assertEqual(self.applies(), [])
+        self.assertEqual(self.post('/api/cleanup/apply', {'id': 'apt', 'code': self.code(secret)}, password='test-password', **self.TUNNEL).status, 200)
+        self.assertTrue(json.loads(self.get('/api/cleanup', **self.TUNNEL).body)['control']['secondFactor'])
 
     # -- deploy incidents ---------------------------------------------------------
     def test_monitor_turns_runner_jobs_into_incidents_at_most_every_30_seconds(self):
