@@ -15,7 +15,7 @@ import { CommandPalette, type CommandItem } from './CommandPalette';
 import { DailyBrief } from './Brief';
 import { LoginPlay } from './LoginPlay';
 import { Apps, JobDrawer, useApps, type Action, type ControlState, type Job } from './Apps';
-import { AmbientField, useNavIndicator, useReveal } from './fluent';
+import { AmbientField, useNavIndicator } from './fluent';
 
 export type Container = { id:string; name:string; image:string; state:string; status:string; project:string; service:string; health:string|null; cpu:number|null; memory:number|null; memoryLimit:number|null; networkRx:number|null; networkTx:number|null; ports:{private:number; public?:number;ip:string;protocol:string}[]; statsError?:boolean; ignoreAlerts?:boolean; monitoringMuted?:boolean; monitoringMuteSource?:'manual'|'label'|'maintenance'|null; maintenanceUntil?:number|null };
 export type HttpCheck = {id:string;service:string;name:string;url:string;source?:'manual'|'label';ok:boolean|null;status:number|null;latency:number|null;checkedAt:number|null;message:string;maintenanceUntil?:number|null};
@@ -92,7 +92,6 @@ function App(){
   const visible=containers.filter(c=>(c.name+' '+c.image+' '+c.project).toLowerCase().includes(query.toLowerCase())&&(filter==='all'||(filter==='pinned'?pinned.includes(c.name):filter==='running'?isGood(c):isIssue(c)))).sort((a,b)=>{const pins=Number(pinned.includes(b.name))-Number(pinned.includes(a.name));return pins||sortDirection*(sort==='cpu'?(b.cpu||0)-(a.cpu||0):sort==='memory'?(b.memory||0)-(a.memory||0):a.name.localeCompare(b.name));});
   const managed=useApps(auth==='ok'&&control.available);
   const navRef=useRef<HTMLElement>(null);
-  useReveal(motion);
   const indicator=useNavIndicator(navRef,`${view}|${control.available}|${auth}|${compact}|${data!==null}`);
   const rowRef=useRowMotion(visible.map(c=>c.id).join(','),motion);
   const changeSort=(field:string)=>{if(sort===field)setSortDirection(v=>-v);else{setSort(field);setSortDirection(1);}};

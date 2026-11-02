@@ -1,20 +1,14 @@
-/* Fluent motion layer: reveal light, acrylic surfaces, connected and staggered transitions.
+/* Fluent motion layer: acrylic surfaces, connected and staggered transitions.
    Every animation here is silenced by :root[data-motion=reduced] and prefers-reduced-motion (interactions.css)
    and paused in hidden documents. Colors come only from theme tokens. */
-:root{--ease-fluent:cubic-bezier(.1,.9,.2,1);--ease-decel:cubic-bezier(0,0,0,1);--reveal:color-mix(in srgb,var(--accent),transparent 91%);--reveal-edge:color-mix(in srgb,var(--accent),transparent 45%)}
+:root{--ease-fluent:cubic-bezier(.1,.9,.2,1);--ease-decel:cubic-bezier(0,0,0,1);--reveal:color-mix(in srgb,var(--accent),transparent 91%)}
 
 /* Ambient signal field */
 .ambient-field{position:fixed;inset:0;width:100vw;height:100dvh;pointer-events:none;z-index:-1;opacity:.9;mask-image:linear-gradient(180deg,#000,#000 35%,transparent 100%);animation:field-in 1.6s var(--ease-decel)}
 @keyframes field-in{from{opacity:0}}
 :root[data-motion=reduced] .ambient-field{opacity:.55}
 
-/* Reveal highlight: light follows the pointer across surfaces; standalone cards also light their edge. */
-:is(.app-card,.service-card,.alert-shortcut,.metric,.brief-grid article,.app-actions>button,.confirm-dialog footer button,.command-list>button,.refresh-button,.job-history button,.event){background-image:radial-gradient(260px circle at var(--rx,-400px) var(--ry,-400px),var(--reveal),transparent 72%);background-repeat:no-repeat}
-:is(.app-actions>button,.confirm-dialog footer button,.refresh-button,.job-history button){background-image:radial-gradient(90px circle at var(--rx,-400px) var(--ry,-400px),color-mix(in srgb,var(--accent),transparent 84%),transparent 75%)}
 .app-card,.service-card,.alert-shortcut{position:relative;isolation:isolate}
-.app-card::before,.service-card::before,.alert-shortcut::before{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:radial-gradient(200px circle at var(--rx,-400px) var(--ry,-400px),var(--reveal-edge),transparent 70%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0);opacity:0;transition:opacity 220ms var(--ease-decel);pointer-events:none;z-index:-1}
-.service-card::before{inset:0}
-.app-card:hover::before,.service-card:hover::before,.alert-shortcut:hover::before{opacity:1}
 .app-card{transition:border-color 200ms,transform 260ms var(--ease-fluent),box-shadow 260ms var(--ease-fluent)}
 .app-card:hover{transform:translateY(-2px);box-shadow:0 14px 34px -22px color-mix(in srgb,var(--accent),transparent 55%)}
 .service-card{transition:border-color 200ms,transform 260ms var(--ease-fluent),box-shadow 260ms var(--ease-fluent)}
