@@ -779,7 +779,14 @@ class DockerProxyTests(unittest.TestCase):
             protocol_version = 'HTTP/1.1'
             def do_GET(self):
                 seen.append(('GET', self.path))
-                body = json.dumps({'path': self.path, 'ApiVersion': '1.44', 'MinAPIVersion': '1.24', 'Version': '29.2.1'}).encode()
+                reply = {'path': self.path, 'ApiVersion': '1.44', 'MinAPIVersion': '1.24', 'Version': '29.2.1'}
+                if self.path.endswith('/json') and '/containers/json' not in self.path:
+                    reply = {'Id': 'ab' * 32, 'Name': '/bot', 'Config': {'Env': ['DISCORD_TOKEN=hunter2'], 'Cmd': ['run', '--key=hunter2']},
+                             'State': {'Status': 'running', 'ExitCode': 0, 'StartedAt': 'now', 'Health': {'Status': 'healthy', 'Log': [{'Output': 'hunter2'}]}},
+                             'RestartCount': 2, 'HostConfig': {'RestartPolicy': {'Name': 'always'}, 'Binds': ['/home:/h']},
+                             'NetworkSettings': {'Networks': {'web': {'IPAddress': '172.18.0.2'}}},
+                             'Mounts': [{'Destination': '/data', 'Type': 'volume', 'RW': True, 'Source': '/var/lib/x'}]}
+                body = json.dumps(reply).encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
@@ -826,10 +833,48 @@ class DockerProxyTests(unittest.TestCase):
             self.assertEqual(server.docker_get('/version')['Version'], '29.2.1')
             self.assertEqual(server.docker_get('/containers/json?all=1')['path'], '/v1.44/containers/json?all=1')
             cid = 'ab' * 32
-            for path in ['/containers/' + cid + '/stats?stream=false&one-shot=true', '/containers/' + cid[:12] + '/json',
+            for path in ['/containers/' + cid + '/stats?stream=false&one-shot=true',
                          '/containers/' + cid[:12] + '/logs?stdout=true&stderr=true&timestamps=true&tail=160']:
                 self.assertEqual(server.docker_get(path)['path'], '/v1.44' + path)
+            inspect = server.docker_get('/containers/' + cid[:12] + '/json')
+        self.assertEqual(inspect['State']['StartedAt'], 'now')
+        self.assertEqual(inspect['RestartCount'], 2)
+        self.assertEqual(inspect['HostConfig'], {'RestartPolicy': {'Name': 'always'}})
+        self.assertEqual(inspect['NetworkSettings'], {'Networks': {'web': {}}})
+        self.assertEqual(inspect['Mounts'], [{'Destination': '/data', 'Type': 'volume', 'RW': True}])
         self.assertEqual(oct(os.stat(self.proxy_path).st_mode & 0o777), '0o660')
+
+    def test_inspect_never_carries_env_command_or_health_output(self):
+        reply = self.raw(b'GET /v1.44/containers/abcdefabcdef/json HTTP/1.1\r\nHost: d\r\n\r\n')
+        self.assertTrue(reply.startswith(b'HTTP/1.1 200'))
+        self.assertNotIn(b'hunter2', reply)
+        self.assertNotIn(b'Env', reply)
+        self.assertNotIn(b'Binds', reply)
+
+    def test_stats_is_pinned_to_one_sample(self):
+        reply = self.raw(b'GET /v1.44/containers/abcdefabcdef/stats HTTP/1.1\r\nHost: d\r\n\r\n')
+        self.assertTrue(reply.startswith(b'HTTP/1.1 200'))
+        self.assertEqual(self.seen, [('GET', '/v1.44/containers/abcdefabcdef/stats?stream=false')])
+
+    def test_streaming_and_unknown_queries_are_refused(self):
+        for target in [b'/v1.44/containers/abcdefabcdef/stats?stream=true', b'/v1.44/containers/abcdefabcdef/logs?follow=1',
+                       b'/v1.44/containers/abcdefabcdef/logs?stdout=1&follow=true', b'/v1.44/containers/abcdefabcdef/logs?tail=all',
+                       b'/v1.44/containers/abcdefabcdef/logs?tail=99999', b'/v1.44/containers/json?all=1&all=1',
+                       b'/v1.44/containers/json?size=1', b'/v1.44/containers/abcdefabcdef/json?size=1', b'/version?x=1',
+                       b'/v1.44/containers/json?all']:
+            with self.subTest(target=target):
+                self.assertTrue(self.raw(b'GET ' + target + b' HTTP/1.1\r\nHost: d\r\n\r\n').startswith(b'HTTP/1.1 403'))
+        self.assertEqual(self.seen, [])
+
+    def test_connections_beyond_the_slots_are_turned_away(self):
+        self.proxy.slots = threading.BoundedSemaphore(1)
+        self.proxy.slots.acquire()
+        try:
+            self.assertTrue(self.raw(b'GET /version HTTP/1.1\r\nHost: d\r\n\r\n').startswith(b'HTTP/1.1 503'))
+        finally:
+            self.proxy.slots.release()
+        self.assertTrue(self.raw(b'GET /version HTTP/1.1\r\nHost: d\r\n\r\n').startswith(b'HTTP/1.1 200'))
+        self.assertEqual(self.seen, [('GET', '/version')])
 
     def test_everything_else_is_refused_before_reaching_docker(self):
         for request in [b'POST /v1.44/containers/abcdefabcdef/restart HTTP/1.1\r\nHost: d\r\n\r\n',
