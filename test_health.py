@@ -28,6 +28,7 @@ class Tree:
         self.write('proc/vmstat', 'pgfault 100\npgmajfault 1200\n')
         for name, value in {'errors_count': '0', 'first_error_time': '0', 'last_error_time': '0', 'lifetime_write_kbytes': '508000000'}.items():
             self.write(f'sys/fs/ext4/mmcblk0p2/{name}', value + '\n')
+        self.write('sys/fs/ext4/features/lazy_itable_init', 'supported\n')  # real kernels list this beside the devices
         self.write('sys/block/zram0/mm_stat', '327680000 102400000 110000000 0 120000000 10 0 0 0\n')
         (self.run / 'systemd/timesync').mkdir(parents=True)
         self.write('run/systemd/timesync/synchronized', '')

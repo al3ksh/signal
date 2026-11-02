@@ -84,7 +84,7 @@ def ext4_stats(sys_root, device):
     base = Path(sys_root) / 'fs/ext4'
     name = os.path.basename(device or '')
     if not (base / name).is_dir():
-        entries = [p.name for p in base.iterdir() if p.is_dir()] if base.is_dir() else []
+        entries = [p.name for p in base.iterdir() if p.is_dir() and p.name != 'features'] if base.is_dir() else []
         name = entries[0] if len(entries) == 1 else None
     if not name:
         return None
