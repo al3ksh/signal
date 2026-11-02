@@ -31,12 +31,22 @@ browser ──HTTPS──> server.py (unprivileged, Docker GET only, as before)
 A mutation needs **all** of:
 
 1. A private SIGNAL session (the access password login).
-2. A request that did **not** come through Cloudflare. cloudflared connects from `127.0.0.1`, so SIGNAL treats any request carrying `Cf-Ray`, `CF-Connecting-IP`, `Cf-Visitor` or `Cf-IPCountry` as public. `status.aleksh.xyz` therefore stays read-only: it shows apps, commits and job history but no buttons ("Control is available over Tailscale or on the host"). `X-Forwarded-For` and `CF-Connecting-IP` are never used to grant access.
-3. A socket peer inside `SIGNAL_CONTROL_ALLOW` — by default Tailscale (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback (`127.0.0.1/32`, `::1/128`).
+2. A private network path, or an enrolled authenticator for the public one. cloudflared connects from `127.0.0.1`, so SIGNAL treats any request carrying `Cf-Ray`, `CF-Connecting-IP`, `Cf-Visitor` or `Cf-IPCountry` as public. Without an authenticator `status.aleksh.xyz` stays read-only: it shows apps, commits and job history but no buttons. With one (see below) it shows the buttons and every step-up there needs the password **and** a code. `X-Forwarded-For` and `CF-Connecting-IP` are never used to grant access.
+3. Off the tunnel, a socket peer inside `SIGNAL_CONTROL_ALLOW` — by default Tailscale (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback (`127.0.0.1/32`, `::1/128`).
 4. A same-origin JSON request (`Origin` equal to `Host`, or `Sec-Fetch-Site: same-origin`, and `Content-Type: application/json`).
-5. A password step-up: the first action asks for the access password again and sets a 10-minute, HttpOnly, SameSite=Strict grant bound to the session. `check` (a `git fetch`) does not need the step-up.
+5. A step-up: the first action asks for the access password again (plus an authenticator or backup code through the public address) and sets a 10-minute, HttpOnly, SameSite=Strict grant bound to the session. Public grants are signed in their own scope, so a password-only grant from Tailscale never works publicly. `check` (a `git fetch`) does not need the step-up.
 
-Requests are rate-limited (20 control requests and 5 failed step-ups per minute per client). Every control request, accepted or refused, is written to the service log (`journalctl -u signal`); those from signed-in sessions also appear in the Signal journal (kind `control`). Anonymous refusals stay out of the journal so they cannot push real events out of it.
+Requests are rate-limited (20 control requests and 5 failed step-ups per minute per client, and 10 failed public step-ups per minute across all addresses, since public addresses are cheap to rotate).
+
+### Control through the public address (authenticator)
+
+Enroll once on the host, as the user SIGNAL runs as, and scan the QR code (or type the setup key) in Google Authenticator, Aegis, 1Password or similar:
+
+```sh
+SIGNAL_DATA_DIR=/var/lib/signal python3 setup_2fa.py
+```
+
+It writes `control-2fa.json` (`0600`) to the data directory, prints the secret and eight one-time backup codes once, and is picked up without a restart. The QR code needs `qrencode` (`sudo apt install qrencode`); without it, add the setup key by hand as a time-based key. Codes are standard TOTP (SHA-1, 6 digits, 30 s, one step of clock drift either way) and each code is accepted once. `--reset` replaces the authenticator and the backup codes; deleting the file makes the public address read-only again. Every control request, accepted or refused, is written to the service log (`journalctl -u signal`); those from signed-in sessions also appear in the Signal journal (kind `control`). Anonymous refusals stay out of the journal so they cannot push real events out of it.
 
 If you add another reverse proxy on the Pi that carries public traffic to `127.0.0.1:8091` (Caddy, nginx), remove the loopback ranges from `SIGNAL_CONTROL_ALLOW`, otherwise public requests through it would look local.
 
@@ -232,11 +242,12 @@ SIGNAL is not Compose-managed on this host and the runner does not manage it. Us
 | `SIGNAL_RUNNER_SOCKET` | `/run/signal-runner/control.sock` | Control socket (created `0660`). |
 | `SIGNAL_RUNNER_CHECK_INTERVAL` | `900` | Seconds between automatic repository checks. |
 
-Web server: `SIGNAL_CONTROL_SOCKET` (unset = control off) and `SIGNAL_CONTROL_ALLOW` (comma-separated CIDRs allowed to mutate).
+Web server: `SIGNAL_CONTROL_SOCKET` (unset = control off), `SIGNAL_CONTROL_ALLOW` (comma-separated CIDRs allowed to mutate) and `SIGNAL_CONTROL_2FA_FILE` (default `$SIGNAL_DATA_DIR/control-2fa.json`; present = public control with a code).
 
 ## Troubleshooting
 
 - **No Apps entry:** `SIGNAL_CONTROL_SOCKET` is unset, or the runner is not running (`systemctl status signal-runner`). `/api/session` reports `control.available`.
+- **"Read-only here" on the public address:** expected until an authenticator is enrolled (`setup_2fa.py`). "Incorrect or already used authenticator code" usually means the phone's clock is off, or the code was just used; wait for the next one.
 - **"Read-only here" on the Tailscale address:** check that the request is not going through Cloudflare and that the peer address is in `SIGNAL_CONTROL_ALLOW` (`journalctl -u signal` shows refused control requests with the client address).
 - **Update refused, "local changes":** someone edited tracked files on the Pi. Inspect with `git -C <dir> status`, then commit/push, stash or discard.
 - **Update refused, "diverged":** the Pi checkout has commits that are not on the remote. Push them or reset the checkout deliberately; the runner only fast-forwards.

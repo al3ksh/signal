@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowClockwise, ArrowCounterClockwise, ArrowsClockwise, CaretDown, Check, CheckCircle, CloudArrowDown, Copy, Eye, EyeSlash, GitBranch, GitCommit, LockKey, MagnifyingGlass, Play, Prohibit, Rocket, Stop, TerminalWindow, Waveform, WarningCircle, X, XCircle } from '@phosphor-icons/react';
 import './apps.css';
 
-export type ControlState = {available:boolean;allowed:boolean;granted:boolean};
+export type ControlState = {available:boolean;allowed:boolean;granted:boolean;secondFactor?:boolean};
 export type GitCommitInfo = {sha:string;subject:string;author:string;time:number};
 export type AppGit = {head?:string;headShort?:string;subject?:string;committedAt?:number;branch?:string|null;expectedBranch?:string;dirty?:boolean;behind?:number;ahead?:number;commits?:GitCommitInfo[];checkedAt?:number;fetched?:boolean;error?:string|null};
 export type Job = {id:string;app:string;action:string;actor?:string;status:string;phase?:string|null;created?:number;started?:number|null;finished?:number|null;exitCode?:number|null;prevCommit?:string|null;newCommit?:string|null;message?:string|null};
@@ -14,7 +14,7 @@ const stateText:Record<string,string>={running:'Running',degraded:'Degraded',sto
 export type Action='start'|'stop'|'restart'|'check'|'update'|'rollback';
 export const actionLabel:Record<string,string>={start:'Start',stop:'Stop',restart:'Restart',check:'Check now',update:'Update',rollback:'Roll back',recover:'Recover'};
 export const busyApp=(app:ManagedApp)=>!!app.activeJob;
-async function postAction(app:string,action:Action,password?:string){const r=await fetch(`/api/apps/${app}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(password?{password}:{})});const d=await r.json().catch(()=>({}));return {ok:r.ok,status:r.status,data:d as {job?:Job;error?:string;stepUp?:boolean}};}
+async function postAction(app:string,action:Action,password?:string,code?:string){const r=await fetch(`/api/apps/${app}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(password?{password,...(code?{code}:{})}:{})});const d=await r.json().catch(()=>({}));return {ok:r.ok,status:r.status,data:d as {job?:Job;error?:string;stepUp?:boolean}};}
 
 export function useApps(enabled:boolean){
   const [apps,setApps]=useState<ManagedApp[]|null>(null),[control,setControl]=useState<ControlState|null>(null),[error,setError]=useState('');
@@ -31,7 +31,7 @@ export function Apps({apps,control,error,reload,request,setRequest,onJob}:{apps:
   const behind=(apps||[]).filter(app=>(app.git?.behind||0)>0).length;
   return <><section className="apps-panel"><div className="section-heading"><h2><Rocket size={19}/>Apps<span>{(apps?.length||0).toString().padStart(2,'0')}</span></h2><span className="small-label">{behind?`${behind} WITH UPDATES`:'REGISTRY + REPOSITORIES'}</span></div>
     {error&&<p className="error apps-error" role="alert"><WarningCircle size={15}/>{error}<button onClick={reload}>Retry<ArrowClockwise size={13}/></button></p>}
-    {control&&!control.allowed&&<p className="apps-note"><LockKey size={13}/>Read-only here. Control is available over Tailscale or on the host.</p>}{actionError&&<p className="error apps-error" role="alert"><WarningCircle size={15}/>{actionError}</p>}
+    {control&&!control.allowed&&<p className="apps-note"><LockKey size={13}/>Read-only here. Control is available over Tailscale, on the host, or here once an authenticator is enrolled on the host.</p>}{actionError&&<p className="error apps-error" role="alert"><WarningCircle size={15}/>{actionError}</p>}
     <div className="app-grid">{(apps||[]).map(app=>{const state=appState(app),git=app.git,count=git?.behind||0,expanded=open===app.id;return <article className={`app-card is-${state}`} key={app.id}>
       <header><span className="service-mark"><Rocket size={17}/></span><span className="service-state"><i className={`dot ${state==='running'?'':state==='degraded'?'bad':'neutral'}`}/>{stateText[state]} · {app.containers.running}/{app.containers.total}</span><span className="app-mode">{app.hasRepo?app.mode==='pull'?'CI IMAGES':'BUILD ON HOST':'NO REPO'}</span></header>
       <strong>{app.name}</strong>
@@ -47,7 +47,7 @@ export function Apps({apps,control,error,reload,request,setRequest,onJob}:{apps:
       <footer>{app.lastJob?<button className="last-job" onClick={()=>onJob(app.lastJob!)}><TerminalWindow size={12}/>Last: {app.lastJob.action} · {app.lastJob.status.replace('_',' ')} · {ago(app.lastJob.finished||app.lastJob.created)}</button>:<span>No jobs yet</span>}<span>{app.hasRepo?`Checked ${ago(git?.checkedAt)}`:''}</span></footer>
     </article>;})}
     {apps&&apps.length===0&&<div className="empty"><Rocket size={28}/><h3>No apps registered.</h3><p>Add entries to the runner registry on the host.</p></div>}</div>
-  </section>{request&&pending&&<ConfirmDialog app={pending} action={request.action} granted={!!control?.granted} onClose={()=>setRequest(null)} onDone={job=>{setRequest(null);onJob(job);reload();}}/>}</>;
+  </section>{request&&pending&&<ConfirmDialog app={pending} action={request.action} granted={!!control?.granted} secondFactor={!!control?.secondFactor} onClose={()=>setRequest(null)} onDone={job=>{setRequest(null);onJob(job);reload();}}/>}</>;
 }
 
 function describe(app:ManagedApp,action:Action){
@@ -62,19 +62,19 @@ function describe(app:ManagedApp,action:Action){
   }
 }
 
-function ConfirmDialog({app,action,granted,onClose,onDone}:{app:ManagedApp;action:Action;granted:boolean;onClose:()=>void;onDone:(job:Job)=>void}){
+function ConfirmDialog({app,action,granted,secondFactor,onClose,onDone}:{app:ManagedApp;action:Action;granted:boolean;secondFactor:boolean;onClose:()=>void;onDone:(job:Job)=>void}){
   const ref=useRef<HTMLDialogElement>(null);
-  const [password,setPassword]=useState(''),[show,setShow]=useState(false),[needPassword,setNeedPassword]=useState(!granted),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  const [password,setPassword]=useState(''),[code,setCode]=useState(''),[show,setShow]=useState(false),[needPassword,setNeedPassword]=useState(!granted),[busy,setBusy]=useState(false),[error,setError]=useState('');
   useEffect(()=>{ref.current?.showModal();},[]);
-  async function submit(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{const result=await postAction(app.id,action,needPassword?password:undefined);if(result.ok&&result.data.job){onDone(result.data.job);return;}if(result.data.stepUp)setNeedPassword(true);setError(result.status===429?'Too many attempts. Try again in a minute.':result.data.error||'The runner refused this action.');}catch{setError('The host did not answer. Try again.');}finally{setBusy(false);}}
+  async function submit(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{const result=await postAction(app.id,action,needPassword?password:undefined,needPassword&&secondFactor?code:undefined);if(result.ok&&result.data.job){onDone(result.data.job);return;}if(result.data.stepUp){setNeedPassword(true);setCode('');}setError(result.status===429?'Too many attempts. Try again in a minute.':result.data.error||'The runner refused this action.');}catch{setError('The host did not answer. Try again.');}finally{setBusy(false);}}
   const danger=action==='stop'||action==='rollback';
   return <dialog ref={ref} className="confirm-dialog" onCancel={onClose} onClick={e=>{if(e.target===e.currentTarget)onClose();}} aria-labelledby="confirm-title"><form onSubmit={submit}>
     <header><span className="mono">APP / {app.id}</span><button type="button" className="icon-button" onClick={onClose} aria-label="Cancel"><X size={19}/></button></header>
     <h2 id="confirm-title">{actionLabel[action]} {app.name}?</h2><p>{describe(app,action)}</p>
     {action==='update'&&(app.git?.commits||[]).length>0&&<ol className="commit-list">{app.git!.commits!.map(commit=><li key={commit.sha}><code>{commit.sha}</code><span>{commit.subject}</span><small>{commit.author} · {ago(commit.time)}</small></li>)}</ol>}
-    {needPassword&&<><label htmlFor="control-password">Access password</label><div className="password-field"><input id="control-password" type={show?'text':'password'} value={password} onChange={e=>setPassword(e.target.value)} autoComplete="current-password" autoFocus required/><button type="button" className="icon-button" onClick={()=>setShow(!show)} aria-label={show?'Hide password':'Show password'}>{show?<EyeSlash size={17}/>:<Eye size={17}/>}</button></div><small className="confirm-hint">Confirms control for the next 10 minutes on this device.</small></>}
+    {needPassword&&<><label htmlFor="control-password">Access password</label><div className="password-field"><input id="control-password" type={show?'text':'password'} value={password} onChange={e=>setPassword(e.target.value)} autoComplete="current-password" autoFocus required/><button type="button" className="icon-button" onClick={()=>setShow(!show)} aria-label={show?'Hide password':'Show password'}>{show?<EyeSlash size={17}/>:<Eye size={17}/>}</button></div>{secondFactor&&<><label htmlFor="control-code">Authenticator code</label><input id="control-code" className="code-field" value={code} onChange={e=>setCode(e.target.value)} inputMode="numeric" autoComplete="one-time-code" placeholder="123 456" maxLength={12} required/></>}<small className="confirm-hint">Confirms control for the next 10 minutes on this device.{secondFactor?' A backup code works too.':''}</small></>}
     {error&&<p className="error" role="alert">{error}</p>}
-    <footer><button type="button" onClick={onClose}>Cancel</button><button className={danger?'confirm-danger':'confirm-go'} disabled={busy||(needPassword&&!password)}>{busy?'Sending…':actionLabel[action]}</button></footer>
+    <footer><button type="button" onClick={onClose}>Cancel</button><button className={danger?'confirm-danger':'confirm-go'} disabled={busy||(needPassword&&(!password||(secondFactor&&!code)))}>{busy?'Sending…':actionLabel[action]}</button></footer>
   </form></dialog>;
 }
 
@@ -82,9 +82,9 @@ const STEPS:Record<string,string[]>={update:['fetch','build','up','health','done
 const terminal=(job:Job)=>!['queued','running'].includes(job.status);
 const statusIcon=(status:string)=>status==='succeeded'?<CheckCircle size={14}/>:status==='rolled_back'||status==='cancelled'?<ArrowCounterClockwise size={14}/>:status==='failed'?<XCircle size={14}/>:<i className="dot"/>;
 
-export function JobDrawer({job:initial,app,canControl,motion,onClose,onChanged}:{job:Job;app:ManagedApp|null;canControl:boolean;motion:boolean;onClose:()=>void;onChanged:()=>void}){
+export function JobDrawer({job:initial,app,canControl,secondFactor=false,motion,onClose,onChanged}:{job:Job;app:ManagedApp|null;canControl:boolean;secondFactor?:boolean;motion:boolean;onClose:()=>void;onChanged:()=>void}){
   const ref=useRef<HTMLDialogElement>(null),logRef=useRef<HTMLPreElement>(null),offset=useRef(0),epoch=useRef<number|null>(null);
-  const [job,setJob]=useState<Job>(initial),[log,setLog]=useState(''),[history,setHistory]=useState<Job[]>([]),[follow,setFollow]=useState(true),[wrap,setWrap]=useState(true),[query,setQuery]=useState(''),[error,setError]=useState(''),[copied,setCopied]=useState(false),[password,setPassword]=useState(''),[needPassword,setNeedPassword]=useState(false),[busy,setBusy]=useState(false);
+  const [job,setJob]=useState<Job>(initial),[log,setLog]=useState(''),[history,setHistory]=useState<Job[]>([]),[follow,setFollow]=useState(true),[wrap,setWrap]=useState(true),[query,setQuery]=useState(''),[error,setError]=useState(''),[copied,setCopied]=useState(false),[password,setPassword]=useState(''),[code,setCode]=useState(''),[needPassword,setNeedPassword]=useState(false),[busy,setBusy]=useState(false);
   useEffect(()=>{ref.current?.showModal();},[]);
   useEffect(()=>{setJob(initial);},[initial]);
   useEffect(()=>{offset.current=0;epoch.current=null;setLog('');setError('');},[job.id]);
@@ -102,7 +102,7 @@ export function JobDrawer({job:initial,app,canControl,motion,onClose,onChanged}:
   },[job.id]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(()=>{if(!app)return;fetch(`/api/apps/${app.id}/jobs`).then(r=>r.ok?r.json():{jobs:[]}).then(d=>setHistory(d.jobs||[])).catch(()=>{});},[app?.id,job.status]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(()=>{if(follow&&logRef.current)logRef.current.scrollTo({top:logRef.current.scrollHeight,behavior:motion?'smooth':'auto'});},[log,follow,motion]);
-  async function cancel(e?:React.FormEvent){e?.preventDefault();setBusy(true);setError('');try{const r=await fetch(`/api/jobs/${job.id}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(needPassword?{password}:{})});const d=await r.json();if(!r.ok){if(d.stepUp)setNeedPassword(true);throw new Error(d.error||'Could not cancel this job.');}setNeedPassword(false);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
+  async function cancel(e?:React.FormEvent){e?.preventDefault();setBusy(true);setError('');try{const r=await fetch(`/api/jobs/${job.id}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(needPassword?{password,...(secondFactor?{code}:{})}:{})});const d=await r.json();if(!r.ok){if(d.stepUp){setNeedPassword(true);setCode('');}throw new Error(d.error||'Could not cancel this job.');}setNeedPassword(false);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
   const lines=log.split('\n').filter(line=>line.toLowerCase().includes(query.toLowerCase()));
   const steps=STEPS[job.action],current=job.status==='rolled_back'?'rolled back':job.phase||'',index=steps?steps.indexOf(current==='pull'?'build':current):-1;
   return <dialog ref={ref} className="drawer job-drawer" onCancel={onClose} onClick={e=>{if(e.target===e.currentTarget)onClose();}} aria-labelledby="job-title"><div className="drawer-inner">
@@ -111,7 +111,7 @@ export function JobDrawer({job:initial,app,canControl,motion,onClose,onChanged}:
     <p className={`job-status is-${job.status}`} role="status">{statusIcon(job.status)}<strong>{job.status.replace('_',' ')}</strong>{job.message&&<span>{job.message}</span>}</p>
     <dl className="job-facts"><dt>Started</dt><dd>{job.started?new Date(job.started*1000).toLocaleString('en-GB'):'Waiting in queue'}</dd><dt>By</dt><dd>{job.actor||'—'}</dd>{job.prevCommit&&<><dt>Commits</dt><dd><code>{job.prevCommit.slice(0,7)}</code> → <code>{(job.newCommit||'…').slice(0,7)}</code></dd></>}{job.finished&&job.started&&<><dt>Duration</dt><dd>{Math.max(0,Math.round(job.finished-job.started))} s</dd></>}</dl>
     {steps&&<ol className={`job-phases ${current==='rollback'||current==='rolled back'?'is-rollback':''}`} style={{'--progress':current==='rollback'||current==='rolled back'||(terminal(job)&&job.status==='succeeded')?1:Math.max(0,index)/(steps.length-1)} as React.CSSProperties} aria-label="Deployment phases">{steps.map((step,i)=><li key={step} className={current==='rollback'||current==='rolled back'?(i<steps.length-1?'skipped':'failed'):i<index||(i===index&&terminal(job)&&job.status==='succeeded')?'done':i===index?'active':''}>{step==='build'&&app?.mode==='pull'?'pull':step}</li>)}{(current==='rollback'||current==='rolled back')&&<li className="active rollback">{current}</li>}</ol>}
-    {!terminal(job)&&canControl&&<form className="job-cancel" onSubmit={cancel}>{needPassword&&<input type="password" aria-label="Access password" placeholder="Access password" value={password} onChange={e=>setPassword(e.target.value)} required/>}<button disabled={busy}><Prohibit size={14}/>{busy?'Cancelling…':'Cancel job'}</button></form>}
+    {!terminal(job)&&canControl&&<form className="job-cancel" onSubmit={cancel}>{needPassword&&<input type="password" aria-label="Access password" placeholder="Access password" value={password} onChange={e=>setPassword(e.target.value)} required/>}{needPassword&&secondFactor&&<input aria-label="Authenticator code" placeholder="Code" inputMode="numeric" autoComplete="one-time-code" maxLength={12} value={code} onChange={e=>setCode(e.target.value)} required/>}<button disabled={busy}><Prohibit size={14}/>{busy?'Cancelling…':'Cancel job'}</button></form>}
     {error&&<p className="error" role="alert">{error}</p>}
     <div className="log-header"><span>Job log</span><button onClick={async()=>{try{await navigator.clipboard.writeText(log);setCopied(true);setTimeout(()=>setCopied(false),2000);}catch{setError('Clipboard access is unavailable in this browser.');}}}>{copied?<Check/>:<Copy/>}{copied?'Copied':'Copy'}</button></div>
     <div className="log-tools"><div className="search-field"><MagnifyingGlass size={14}/><input aria-label="Filter job log" placeholder="Filter output…" value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<button aria-label="Clear log filter" onClick={()=>setQuery('')}><X size={12}/></button>}</div><button className={follow?'active':''} aria-pressed={follow} onClick={()=>setFollow(!follow)}><Waveform size={14}/>Follow</button><button className={wrap?'active':''} aria-pressed={wrap} onClick={()=>setWrap(!wrap)}>Wrap</button></div>

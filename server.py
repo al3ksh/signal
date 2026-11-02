@@ -1,4 +1,5 @@
 """SIGNAL: bounded, read-only host/Docker telemetry. Python standard library only."""
+import base64
 import concurrent.futures
 import hashlib
 import hmac
@@ -48,6 +49,11 @@ CONTROL_ATTEMPTS = {}
 CONTROL_RATE = {}
 CONTROL_CACHE = {}
 TUNNEL_HEADERS = ('Cf-Ray', 'Cf-Connecting-Ip', 'Cf-Visitor', 'Cf-Ipcountry')
+# Enrolling an authenticator (setup_2fa.py) also allows control through the public address, with a code on every step-up.
+CONTROL_2FA_FILE = Path(os.getenv('SIGNAL_CONTROL_2FA_FILE', str(DATA_DIR / 'control-2fa.json')))
+CONTROL_2FA_LOCK = threading.Lock()
+CONTROL_2FA_USED = {}
+PUBLIC_STEP_UP_LIMIT = 10  # failed public step-ups per minute across every address
 
 
 def make_session(expiry=None):
@@ -108,23 +114,68 @@ def control_available():
     return result
 
 
-def make_control_grant(session_token, expiry=None):
-    """A 10-minute step-up grant bound to one session token, signed with a separate HMAC domain."""
+def make_control_grant(session_token, expiry=None, scope='control'):
+    """A 10-minute step-up grant bound to one session token, signed with a separate HMAC domain.
+    Grants minted with a second factor use their own scope, so a password-only grant never works publicly."""
     payload = str(expiry or int(time.time()) + CONTROL_GRANT_SECONDS) + '.' + secrets.token_hex(8)
-    message = ('control:' + payload + ':' + session_token.rsplit('.', 1)[0]).encode()
+    message = (scope + ':' + payload + ':' + session_token.rsplit('.', 1)[0]).encode()
     return payload + '.' + hmac.new(bytes.fromhex(AUTH['secret']), message, hashlib.sha256).hexdigest()
 
 
-def valid_control_grant(grant, session_token):
+def valid_control_grant(grant, session_token, scope='control'):
     if not AUTH or not grant or not session_token:
         return False
     try:
         payload, signature = grant.rsplit('.', 1)
-        message = ('control:' + payload + ':' + session_token.rsplit('.', 1)[0]).encode()
+        message = (scope + ':' + payload + ':' + session_token.rsplit('.', 1)[0]).encode()
         expected = hmac.new(bytes.fromhex(AUTH['secret']), message, hashlib.sha256).hexdigest()
         return time.time() < int(payload.split('.')[0]) and hmac.compare_digest(signature, expected)
     except (ValueError, AttributeError):
         return False
+
+
+def load_2fa():
+    try:
+        data = json.loads(CONTROL_2FA_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get('secret'), str) and data['secret'] else None
+
+
+def totp(secret, counter):
+    """RFC 6238 code (SHA-1, 6 digits, 30 s), what Google Authenticator and friends show."""
+    key = base64.b32decode(secret.upper() + '=' * (-len(secret) % 8))
+    digest = hmac.new(key, struct.pack('>Q', counter), hashlib.sha1).digest()
+    offset = digest[-1] & 15
+    return '%06d' % ((struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7fffffff) % 1000000)
+
+
+def verify_second_factor(code):
+    """A current authenticator code (one step of clock drift either way, each code once) or an unused
+    backup code, which is spent."""
+    code = re.sub(r'[\s-]', '', str(code or ''))[:32].lower()
+    with CONTROL_2FA_LOCK:
+        data = load_2fa()
+        if not data or not code:
+            return False
+        if len(code) == 6 and code.isdigit():
+            now = int(time.time()) // 30
+            for counter in (now - 1, now, now + 1):
+                if counter > CONTROL_2FA_USED.get('counter', -1) and hmac.compare_digest(totp(data['secret'], counter), code):
+                    CONTROL_2FA_USED['counter'] = counter
+                    return True
+            return False
+        digest = hashlib.sha256(code.encode()).hexdigest()
+        backup = [item for item in data.get('backup') or [] if isinstance(item, str)]
+        if not any(hmac.compare_digest(digest, item) for item in backup):
+            return False
+        data['backup'] = [item for item in backup if item != digest]
+        temporary = CONTROL_2FA_FILE.with_name(CONTROL_2FA_FILE.name + '.tmp')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(data, stream)
+        temporary.replace(CONTROL_2FA_FILE)
+        return True
 
 
 def join_apps(apps, containers):
@@ -484,7 +535,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def control_network_allowed(self):
         if self.via_tunnel():
-            return False
+            # Public requests may control apps only once an authenticator is enrolled; every step-up then needs its code.
+            return load_2fa() is not None
         try:
             peer = self.peer()
         except ValueError:
@@ -494,8 +546,11 @@ class Handler(BaseHTTPRequestHandler):
     def control_state(self, available=None):
         available = control_available() if available is None else available
         allowed = bool(available and AUTH and self.authenticated() and self.control_network_allowed())
-        granted = allowed and valid_control_grant(self.cookie_value('signal_control'), self.cookie_value('signal_session'))
-        return {'available': bool(available), 'allowed': allowed, 'granted': granted}
+        granted = allowed and valid_control_grant(self.cookie_value('signal_control'), self.cookie_value('signal_session'), self.grant_scope())
+        return {'available': bool(available), 'allowed': allowed, 'granted': granted, 'secondFactor': allowed and self.via_tunnel()}
+
+    def grant_scope(self):
+        return 'control-2fa' if self.via_tunnel() else 'control'
 
     def cookie(self, token, age):
         secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
@@ -737,7 +792,8 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def control_post(self, app_id, action, job_id=None):
-        """Gate order: configured, rate, session, network, same-origin, registry, step-up. Only {app, action} reach the runner."""
+        """Gate order: configured, rate, session, network, same-origin, registry, step-up (password, plus an
+        authenticator code through the public address). Only {app, action} reach the runner."""
         if not CONTROL_SOCKET:
             return self.json(404, {'error': 'Unknown endpoint.'})
         name = app_id or job_id[:12]
@@ -762,21 +818,31 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if app_id is not None and app_id not in {app.get('id') for app in control_call({'op': 'list'})['apps']}:
                 return refuse(404, 'Unknown app.')
-            session = self.cookie_value('signal_session')
-            if action != 'check' and not valid_control_grant(self.cookie_value('signal_control'), session):
-                password = body.get('password')
-                if self.limited(CONTROL_ATTEMPTS, self.client_key(), 5, record=False):
+            session, public = self.cookie_value('signal_session'), self.via_tunnel()
+            if action != 'check' and not valid_control_grant(self.cookie_value('signal_control'), session, self.grant_scope()):
+                password, code = body.get('password'), body.get('code')
+                # Public addresses are cheap to rotate, so public failures also share one budget.
+                if (self.limited(CONTROL_ATTEMPTS, self.client_key(), 5, record=False)
+                        or public and self.limited(CONTROL_ATTEMPTS, 'public', PUBLIC_STEP_UP_LIMIT, record=False)):
                     return refuse(429, 'Too many password attempts. Try again in a minute.')
-                if not isinstance(password, str) or not password:
-                    return refuse(403, 'Confirm with your access password.', stepUp=True)
+                if not isinstance(password, str) or not password or public and (not isinstance(code, str) or not code):
+                    message = 'Confirm with your access password and authenticator code.' if public else 'Confirm with your access password.'
+                    return refuse(403, message, stepUp=True, secondFactor=public)
+                def failed(message):
+                    self.limited(CONTROL_ATTEMPTS, self.client_key(), 5)
+                    if public:
+                        self.limited(CONTROL_ATTEMPTS, 'public', PUBLIC_STEP_UP_LIMIT)
+                    return refuse(403, message, stepUp=True, secondFactor=public)
                 digest = hashlib.pbkdf2_hmac('sha256', password[:1024].encode(), bytes.fromhex(AUTH['salt']), AUTH['iterations']).hex()
                 if not hmac.compare_digest(digest, AUTH['hash']):
-                    self.limited(CONTROL_ATTEMPTS, self.client_key(), 5)
-                    return refuse(403, 'Incorrect password.', stepUp=True)
+                    return failed('Incorrect password.')
+                if public and not verify_second_factor(code):
+                    return failed('Incorrect or already used authenticator code.')
                 with AUTH_LOCK:
                     CONTROL_ATTEMPTS.pop(self.client_key(), None)
                 secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
-                self.cookie_header = 'signal_control=' + make_control_grant(session) + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + str(CONTROL_GRANT_SECONDS) + secure
+                self.cookie_header = ('signal_control=' + make_control_grant(session, scope=self.grant_scope()) + '; Path=/; HttpOnly; SameSite=Strict; Max-Age='
+                                      + str(CONTROL_GRANT_SECONDS) + secure)
             if job_id:
                 result = control_call({'op': 'cancel', 'id': job_id})
                 self.audit(name, action, 'accepted', 'Cancel requested.')

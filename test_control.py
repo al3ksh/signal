@@ -13,6 +13,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 import server
+import setup_2fa
 
 
 class FakeRunnerHandler(socketserver.StreamRequestHandler):
@@ -95,6 +96,13 @@ class ControlTests(unittest.TestCase):
         enabled = patch.object(server, 'CONTROL_SOCKET', self.socket)
         enabled.start()
         self.addCleanup(enabled.stop)
+        self.totp_file = os.path.join(self.tmp.name, 'control-2fa.json')
+        if os.path.exists(self.totp_file):
+            os.unlink(self.totp_file)
+        enrolled = patch.object(server, 'CONTROL_2FA_FILE', server.Path(self.totp_file))
+        enrolled.start()
+        self.addCleanup(enrolled.stop)
+        server.CONTROL_2FA_USED.clear()
         self.session = 'signal_session=' + server.make_session()
 
     def request(self, path, method='GET', body=None, headers=None, raw=None):
@@ -117,7 +125,7 @@ class ControlTests(unittest.TestCase):
                 with self.subTest(path=path):
                     self.assertEqual(self.get(path).status, 404)
             session = json.loads(self.get('/api/session').body)
-            self.assertEqual(session['control'], {'available': False, 'allowed': False, 'granted': False})
+            self.assertEqual(session['control'], {'available': False, 'allowed': False, 'granted': False, 'secondFactor': False})
         self.assertEqual(self.runner.requests, [])
 
     def test_apps_require_session(self):
@@ -133,11 +141,11 @@ class ControlTests(unittest.TestCase):
             {'name': 'portfolio-web-1', 'service': 'web', 'state': 'running', 'health': None}]})
         self.assertEqual(portfolio['git']['behind'], 2)
         self.assertEqual(next(a for a in data['apps'] if a['id'] == 'lights-out')['containers']['total'], 0)
-        self.assertEqual(data['control'], {'available': True, 'allowed': True, 'granted': False})
+        self.assertEqual(data['control'], {'available': True, 'allowed': True, 'granted': False, 'secondFactor': False})
 
     def test_session_reports_control_availability(self):
         session = json.loads(self.get('/api/session').body)
-        self.assertEqual(session['control'], {'available': True, 'allowed': True, 'granted': False})
+        self.assertEqual(session['control'], {'available': True, 'allowed': True, 'granted': False, 'secondFactor': False})
 
     def test_runner_down_is_unavailable_not_an_error_page(self):
         with patch.object(server, 'CONTROL_SOCKET', os.path.join(self.tmp.name, 'missing.sock')):
@@ -146,7 +154,7 @@ class ControlTests(unittest.TestCase):
 
     def test_tunnel_requests_are_read_only(self):
         session = json.loads(self.get('/api/session', **{'Cf-Ray': 'x', 'CF-Connecting-IP': '100.64.0.9'}).body)
-        self.assertEqual(session['control'], {'available': True, 'allowed': False, 'granted': False})
+        self.assertEqual(session['control'], {'available': True, 'allowed': False, 'granted': False, 'secondFactor': False})
         data = json.loads(self.get('/api/apps', **{'CF-Connecting-IP': '203.0.113.9'}).body)
         self.assertFalse(data['control']['allowed'])
         self.assertEqual(len(data['apps']), 2)
@@ -187,6 +195,74 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.runs(), [])
         event = self.control_events()[0]
         self.assertEqual((event['name'], event['state'], event['outcome']), ('portfolio', 'restart', 'refused'))
+
+    # -- public control with an authenticator ------------------------------------
+    TUNNEL = {'Cf-Ray': 'abc', 'CF-Connecting-IP': '198.51.100.7'}
+
+    def enroll(self):
+        secret, uri, backup = setup_2fa.create_2fa(self.totp_file)
+        self.assertTrue(uri.startswith('otpauth://totp/'))
+        return secret, backup
+
+    def code(self, secret, step=0):
+        return server.totp(secret, int(server.time.time()) // 30 + step)
+
+    def test_enrolled_tunnel_allows_control_with_second_factor(self):
+        self.enroll()
+        session = json.loads(self.get('/api/session', **self.TUNNEL).body)
+        self.assertEqual(session['control'], {'available': True, 'allowed': True, 'granted': False, 'secondFactor': True})
+        self.assertEqual(json.loads(self.get('/api/session').body)['control']['secondFactor'], False)
+
+    def test_tunnel_step_up_needs_password_and_code(self):
+        secret, _ = self.enroll()
+        response = self.post('/api/apps/portfolio/restart', password='test-password', **self.TUNNEL)
+        self.assertEqual(response.status, 403)
+        self.assertTrue(json.loads(response.body)['secondFactor'])
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': '000000'}, password='test-password', **self.TUNNEL).status, 403)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': self.code(secret)}, password='wrong', **self.TUNNEL).status, 403)
+        self.assertEqual(self.runs(), [])
+        response = self.post('/api/apps/portfolio/restart', {'code': self.code(secret)}, password='test-password', **self.TUNNEL)
+        self.assertEqual(response.status, 202)
+        grant = response.headers['Set-Cookie'].split(';')[0]
+        both = self.session + '; ' + grant
+        self.assertEqual(self.post('/api/apps/portfolio/stop', Cookie=both, **self.TUNNEL).status, 202)
+        self.assertTrue(json.loads(self.get('/api/session', Cookie=both, **self.TUNNEL).body)['control']['granted'])
+
+    def test_authenticator_code_works_once(self):
+        secret, _ = self.enroll()
+        code = self.code(secret)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': code}, password='test-password', **self.TUNNEL).status, 202)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': code}, password='test-password', **self.TUNNEL).status, 403)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': self.code(secret, -1)}, password='test-password', **self.TUNNEL).status, 403)
+
+    def test_password_only_grant_does_not_work_publicly(self):
+        self.enroll()
+        grant = 'signal_control=' + server.make_control_grant(self.session.split('=', 1)[1])
+        both = self.session + '; ' + grant
+        self.assertEqual(self.post('/api/apps/portfolio/stop', Cookie=both).status, 202)
+        self.assertEqual(self.post('/api/apps/portfolio/stop', Cookie=both, **self.TUNNEL).status, 403)
+        self.assertFalse(json.loads(self.get('/api/session', Cookie=both, **self.TUNNEL).body)['control']['granted'])
+
+    def test_backup_code_is_spent(self):
+        _, backup = self.enroll()
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': backup[0].upper()}, password='test-password', **self.TUNNEL).status, 202)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': backup[0]}, password='test-password', **self.TUNNEL).status, 403)
+        with open(self.totp_file) as stream:
+            self.assertEqual(len(json.load(stream)['backup']), 7)
+        self.assertEqual(oct(os.stat(self.totp_file).st_mode & 0o777), '0o600')
+
+    def test_private_networks_do_not_need_a_code(self):
+        self.enroll()
+        self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password').status, 202)
+
+    def test_public_failures_share_one_budget(self):
+        self.enroll()
+        for i in range(server.PUBLIC_STEP_UP_LIMIT):
+            headers = {'Cf-Ray': 'x', 'CF-Connecting-IP': '198.51.100.' + str(i + 10)}
+            self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': '000000'}, password='test-password', **headers).status, 403)
+        headers = {'Cf-Ray': 'x', 'CF-Connecting-IP': '203.0.113.200'}
+        self.assertEqual(self.post('/api/apps/portfolio/restart', {'code': '000000'}, password='test-password', **headers).status, 429)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password').status, 202)
 
     def test_networks_outside_allow_list_cannot_mutate(self):
         with patch.object(server, 'CONTROL_ALLOW', [server.ipaddress.ip_network('100.64.0.0/10')]):
