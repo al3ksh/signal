@@ -175,6 +175,12 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(response.status, 401)
         self.assertEqual(self.runs(), [])
 
+    def test_unauthenticated_refusals_do_not_flood_the_journal(self):
+        for _ in range(3):
+            self.request('/api/apps/portfolio/restart', 'POST', {}, {'Origin': 'http://' + self.host, 'Content-Type': 'application/json', 'Cf-Ray': 'x'})
+            self.request('/api/apps/portfolio/restart', 'POST', {}, {'Origin': 'https://evil.example'})
+        self.assertEqual(self.control_events(), [])
+
     def test_tunnel_requests_cannot_mutate(self):
         response = self.post('/api/apps/portfolio/restart', password='test-password', **{'Cf-Ray': 'abc', 'CF-Connecting-IP': '100.100.1.1'})
         self.assertEqual(response.status, 403)
