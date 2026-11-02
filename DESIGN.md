@@ -49,6 +49,9 @@ The sidebar becomes an icon rail at 1250px and a top navigation bar at 640px. Th
 - Log tools filter actual returned lines, control wrapping, and optionally follow refreshed snapshots every five seconds.
 - Charts retain keyboard sample inspection. Navigation, presets, filters, range selectors and toggles expose selected state.
 
+- Fluent layer (`src/fluent.tsx`, `src/fluent.css`): a pointer-tracked reveal light on cards, metrics and controls, with an edge glow on standalone cards; a navigation indicator that slides between views; acrylic (blurred, translucent) confirm and command dialogs; cards that rise in with a short stagger when a view opens (polling never replays it); pressed controls compress to 96.5%; commit lists unfold; job phases fill a progress rail, the active phase shimmers and status icons pop on change; live job log lines fade in.
+- An ambient signal field sits behind the interface: four slow oscilloscope traces, two travelling pulses and a faint sweep, fading out toward the bottom, bending slightly around the pointer. It is decorative and never encodes measurements. It draws at most 30 frames per second, follows the theme accent, and freezes to a static frame when motion is quiet or reduced, observation is paused or the document is hidden.
+
 `prefers-reduced-motion` always wins over the full-motion setting. The quiet mode removes transitions and loops. The map stops when paused, outside the viewport or in a hidden document; other CSS loops pause when the document is hidden. Effects run client-side, with no change to the host collector interval.
 
 ## Boundaries
