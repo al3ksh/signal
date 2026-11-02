@@ -99,6 +99,28 @@ class AlertEngine:
                 self.store.resolve_alert(key, now)
                 self.active.remove(key)
 
+    def evaluate_deploys(self, apps, now):
+        """App-control jobs: the last non-check job of each app failing or rolling back is an incident;
+        the next successful one resolves it. Running jobs and an unreachable runner change nothing."""
+        with self.lock:
+            maintenance = self.active_maintenance(now)
+            keys = set()
+            for app in apps:
+                key = 'deploy:' + str(app.get('id'))
+                keys.add(key)
+                job = app.get('lastDeploy')
+                if job and job.get('status') in ('queued', 'running'):
+                    continue
+                status = (job or {}).get('status')
+                bad = status in ('failed', 'rolled_back') and app.get('id') not in maintenance
+                outcome = 'rolled back' if status == 'rolled_back' else 'failed'
+                self.check(key, bad, f"{app.get('name') or app.get('id')}: {(job or {}).get('action', 'job')} {outcome}",
+                           str((job or {}).get('message') or 'See the job log in Apps.')[:300], now, delay=0,
+                           severity='warning' if status == 'rolled_back' else 'critical')
+            for key in list(self.active):
+                if key.startswith('deploy:') and key not in keys:
+                    self.clear_condition(key, now)
+
     def evaluate(self, data):
         with self.lock:
             now, host = data['timestamp'], data['host']

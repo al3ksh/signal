@@ -242,6 +242,7 @@ class Monitor:
         self.check_results = {}
         self.last_check_time = 0
         self.boot_at = time.time()
+        self.last_deploy_check = 0
 
     @staticmethod
     def http_check(check, now):
@@ -410,6 +411,7 @@ class Monitor:
         point = {'time': now, 'cpu': data['host']['cpu'], 'memory': data['host']['memory']['used']/memory['MemTotal']*100, 'temperature': data['host']['temperature'], 'rx': sum(i['rx'] for i in interfaces), 'tx': sum(i['tx'] for i in interfaces)}
         self.store.add(point)
         self.alert_engine.evaluate(data)
+        self.deploy_alerts(now)
         data['alerts'] = self.store.alerts()
         with self.lock:
             self.history.append(point)
@@ -417,6 +419,17 @@ class Monitor:
             data['events'] = list(self.events)
             self.snapshot = data
         self.last_cpu, self.last_net, self.last_time = cpu, network, mono
+
+    def deploy_alerts(self, now):
+        """Failed or rolled-back app jobs become incidents. Polls the runner at most every 30 s."""
+        if not CONTROL_SOCKET or now - self.last_deploy_check < 30:
+            return
+        self.last_deploy_check = now
+        try:
+            apps = control_call({'op': 'list'}, timeout=3)['apps']
+        except ControlError:
+            return
+        self.alert_engine.evaluate_deploys(apps, now)
 
     def run(self):
         while not self.stop.is_set():

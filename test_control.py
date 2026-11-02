@@ -271,6 +271,23 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.get('/api/apps/nope/jobs').status, 404)
         self.assertEqual(self.post('/api/jobs/' + job + '/cancel', password='test-password').status, 200)
 
+    # -- deploy incidents ---------------------------------------------------------
+    def test_monitor_turns_runner_jobs_into_incidents_at_most_every_30_seconds(self):
+        self.runner.apps[0]['lastDeploy'] = {'id': 'f' * 32, 'action': 'update', 'status': 'failed', 'message': 'Build failed.'}
+        calls = []
+        engine = type('Engine', (), {'evaluate_deploys': lambda self, apps, now: calls.append([a['id'] for a in apps])})()
+        monitor = type('Monitor', (), {'alert_engine': engine, 'last_deploy_check': 0})()
+        try:
+            server.Monitor.deploy_alerts(monitor, 1000)
+            server.Monitor.deploy_alerts(monitor, 1010)
+            server.Monitor.deploy_alerts(monitor, 1031)
+        finally:
+            self.runner.apps[0].pop('lastDeploy')
+        self.assertEqual(calls, [['portfolio', 'lights-out']] * 2)
+        with patch.object(server, 'CONTROL_SOCKET', os.path.join(self.tmp.name, 'missing.sock')):
+            server.Monitor.deploy_alerts(monitor, 2000)  # runner down: unknown, not recovered
+        self.assertEqual(len(calls), 2)
+
 
 if __name__ == '__main__':
     unittest.main()
