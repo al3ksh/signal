@@ -214,6 +214,135 @@ class CheckTests(RunnerCase):
         self.assertEqual(item.summary('demo')['git']['behind'], 1)
 
 
+def wait(item, job_id, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = item.store.job(job_id)
+        if job['status'] not in ('queued', 'running'):
+            return job
+        time.sleep(0.02)
+    raise AssertionError('job did not finish: ' + json.dumps(item.store.job(job_id)))
+
+
+class LifecycleTests(RunnerCase):
+    def test_lifecycle_actions_run_fixed_compose_argv(self):
+        fixture = Fixture(self.root, repo=False)
+        item = self.make_runner(fixture)
+        compose = ['compose', '--project-directory', str(fixture.dir.resolve()), '-p', 'demo', '-f', str((fixture.dir / 'compose.yml').resolve())]
+        for action, tail in [('start', ['up', '-d']), ('stop', ['stop']), ('restart', ['restart'])]:
+            with self.subTest(action=action):
+                job = wait(item, item.submit('demo', action, 'tester')['id'])
+                self.assertEqual(job['status'], 'succeeded', job)
+                self.assertEqual(job['actor'], 'tester')
+                self.assertEqual(fixture.calls()[-2]['argv'], compose + tail)
+                log = item.read_log(job['id'], 0)
+                self.assertIn('$ docker compose', log['data'])
+                self.assertTrue(log['done'])
+
+    def test_failed_command_marks_job_failed(self):
+        fixture = Fixture(self.root, repo=False)
+        fixture.configure(fail={'restart': 3})
+        item = self.make_runner(fixture)
+        job = wait(item, item.submit('demo', 'restart', 'tester')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['exitCode'], 3)
+        self.assertIn('fake docker failure', item.read_log(job['id'], 0)['data'])
+
+    def test_rejects_unknown_app_action_and_repo_actions_without_repo(self):
+        fixture = Fixture(self.root, repo=False)
+        item = self.make_runner(fixture)
+        for request, code in [({'op': 'run', 'app': 'nope', 'action': 'start'}, 'not_found'),
+                              ({'op': 'run', 'app': 'demo', 'action': 'exec'}, 'invalid'),
+                              ({'op': 'run', 'app': 'demo', 'action': 'update'}, 'invalid'),
+                              ({'op': 'run', 'app': 'demo', 'action': ['start']}, 'invalid')]:
+            with self.subTest(request=request), self.assertRaises(runner.RequestError) as caught:
+                item.handle(request)
+            self.assertEqual(caught.exception.code, code)
+        self.assertEqual(fixture.calls(), [])
+
+    def test_actor_is_sanitised(self):
+        fixture = Fixture(self.root, repo=False)
+        item = self.make_runner(fixture)
+        job = wait(item, item.handle({'op': 'run', 'app': 'demo', 'action': 'start', 'actor': 'x\n$(id)' + 'y' * 200})['job']['id'])
+        self.assertEqual(job['actor'], 'x_$(id)' + 'y' * 73)
+
+    def test_one_job_at_a_time_per_app_and_duplicates_refused(self):
+        fixture = Fixture(self.root, repo=False)
+        fixture.configure(sleep={'restart': 0.4})
+        item = self.make_runner(fixture)
+        first = item.submit('demo', 'restart', 't')['id']
+        with self.assertRaises(runner.RequestError) as caught:
+            item.submit('demo', 'restart', 't')
+        self.assertEqual(caught.exception.code, 'conflict')
+        second = item.submit('demo', 'stop', 't')['id']
+        self.assertEqual(item.summary('demo')['activeJob']['id'], first)
+        wait(item, first)
+        wait(item, second)
+        calls = fixture.calls()
+        restart_end = next(c['time'] for c in calls if c.get('end') == 'restart')
+        stop_start = next(c['start'] for c in calls if c.get('sub') == 'stop')
+        self.assertGreaterEqual(stop_start, restart_end)
+
+    def test_cancel_queued_and_running_jobs(self):
+        fixture = Fixture(self.root, repo=False)
+        fixture.configure(sleep={'restart': 5})
+        item = self.make_runner(fixture)
+        running = item.submit('demo', 'restart', 't')['id']
+        queued = item.submit('demo', 'stop', 't')['id']
+        time.sleep(0.3)
+        item.cancel(queued)
+        item.cancel(running)
+        self.assertEqual(wait(item, running, 8)['status'], 'cancelled')
+        self.assertEqual(wait(item, queued)['status'], 'cancelled')
+        self.assertFalse(any(c.get('sub') == 'stop' for c in fixture.calls()))
+
+    def test_lifecycle_timeout(self):
+        fixture = Fixture(self.root, repo=False)
+        fixture.configure(sleep={'restart': 5})
+        item = self.make_runner(fixture)
+        item.timeouts = {**item.timeouts, 'lifecycle': 0.3}
+        job = wait(item, item.submit('demo', 'restart', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('timed out', job['message'])
+
+    def test_log_is_capped_and_paged(self):
+        fixture = Fixture(self.root, repo=False)
+        fixture.configure(output={'restart': 'x' * 5000})
+        item = self.make_runner(fixture)
+        item.log_cap = 1000
+        job = wait(item, item.submit('demo', 'restart', 't')['id'])
+        size = (item.data_dir / 'logs' / (job['id'] + '.log')).stat().st_size
+        self.assertLess(size, 1200)
+        first = item.read_log(job['id'], 0, limit=100)
+        self.assertEqual(first['offset'], 100)
+        rest = item.read_log(job['id'], first['offset'])
+        self.assertIn('log truncated', rest['data'])
+
+    def test_history_is_pruned_and_interrupted_jobs_recovered(self):
+        fixture = Fixture(self.root, repo=False)
+        item = self.make_runner(fixture)
+        item.keep_jobs = 3
+        ids = [wait(item, item.submit('demo', 'start', 't')['id'])['id'] for _ in range(5)]
+        self.assertEqual([j['id'] for j in item.store.jobs('demo', 10)], ids[:1:-1])
+        self.assertFalse((item.data_dir / 'logs' / (ids[0] + '.log')).exists())
+        with item.store.lock, item.store.db:
+            item.store.db.execute("UPDATE jobs SET status='running' WHERE id=?", (ids[-1],))
+        item.close()
+        self.runners.remove(item)
+        again = self.make_runner(fixture)
+        self.assertEqual(again.store.job(ids[-1])['status'], 'failed')
+        self.assertIn('interrupted', again.store.job(ids[-1])['message'])
+
+    def test_check_job_logs_result(self):
+        fixture = Fixture(self.root)
+        fixture.push('second')
+        item = self.make_runner(fixture)
+        job = wait(item, item.submit('demo', 'check', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded')
+        self.assertIn('1 commit(s) behind', item.read_log(job['id'], 0)['data'])
+        self.assertEqual(item.summary('demo')['git']['behind'], 1)
+
+
 class SocketTests(RunnerCase):
     def test_list_status_and_errors_over_unix_socket(self):
         fixture = Fixture(self.root)

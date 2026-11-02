@@ -8,11 +8,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import signal
 import socketserver
 import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 
 REGISTRY = os.getenv('SIGNAL_RUNNER_REGISTRY', '/etc/signal/apps.json')
 DATA_DIR = os.getenv('SIGNAL_RUNNER_DATA_DIR', '/var/lib/signal-runner')
@@ -23,10 +26,30 @@ REMOTE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,39}')
 BRANCH = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
 GIT_TIMEOUT = 120
 MAX_REQUEST = 64 * 1024
+ACTIONS = ('start', 'stop', 'restart', 'check', 'update', 'rollback')
+REPO_ACTIONS = ('check', 'update', 'rollback')
+TIMEOUTS = {'lifecycle': 120, 'build': 1800, 'git': GIT_TIMEOUT}
+LOG_CAP = 2 * 1024 * 1024
+KEEP_JOBS = 200
+JOB_ID = re.compile(r'[a-f0-9]{32}')
 
 
 class RegistryError(ValueError):
     pass
+
+
+class StepFailed(Exception):
+    def __init__(self, message, exit_code=None):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+class JobCancelled(Exception):
+    pass
+
+
+class RollbackDone(Exception):
+    """The deploy failed and the previous commit is running again."""
 
 
 class RequestError(Exception):
@@ -132,6 +155,34 @@ class JobStore:
         with self.lock, self.db:
             self.db.execute('INSERT OR REPLACE INTO checks VALUES (?,?)', (app, json.dumps(value)))
 
+    def create(self, job):
+        with self.lock, self.db:
+            self.db.execute('INSERT INTO jobs(id,app,action,actor,status,created) VALUES (?,?,?,?,?,?)',
+                            (job['id'], job['app'], job['action'], job['actor'], 'queued', job['created']))
+
+    def update(self, job_id, **fields):
+        columns = ('status', 'phase', 'started', 'finished', 'exit_code', 'prev_commit', 'new_commit', 'message', 'images')
+        assert set(fields) <= set(columns)
+        with self.lock, self.db:
+            self.db.execute('UPDATE jobs SET ' + ','.join(k + '=?' for k in fields) + ' WHERE id=?', (*fields.values(), job_id))
+
+    def row(self, job_id):
+        with self.lock:
+            return self.db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+
+    def job(self, job_id):
+        return public_job(self.row(job_id))
+
+    def recover(self, now):
+        with self.lock, self.db:
+            self.db.execute("UPDATE jobs SET status='failed', finished=?, message='Runner restarted; job interrupted.' WHERE status IN ('queued','running')", (now,))
+
+    def prune(self, keep):
+        with self.lock, self.db:
+            old = [r[0] for r in self.db.execute('SELECT id FROM jobs ORDER BY created DESC LIMIT -1 OFFSET ?', (keep,))]
+            self.db.executemany('DELETE FROM jobs WHERE id=?', [(i,) for i in old])
+            return old
+
     def jobs(self, app, limit=20):
         with self.lock:
             return [public_job(r) for r in self.db.execute('SELECT * FROM jobs WHERE app=? ORDER BY created DESC LIMIT ?', (app, limit))]
@@ -157,6 +208,15 @@ class Runner:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = JobStore(self.data_dir / 'jobs.db')
+        self.store.recover(time.time())
+        self.logs = self.data_dir / 'logs'
+        self.logs.mkdir(exist_ok=True)
+        self.timeouts = dict(TIMEOUTS)
+        self.log_cap = LOG_CAP
+        self.keep_jobs = KEEP_JOBS
+        self.active = {}
+        self.active_lock = threading.Lock()
+        self.build_slot = threading.Semaphore(1)  # one build or pull at a time protects the Pi's RAM
         self.path = path or os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')
         self.check_interval = check_interval
         self.app_locks = {app_id: threading.Lock() for app_id in apps}
@@ -166,8 +226,8 @@ class Runner:
     # -- process execution -------------------------------------------------
     def env(self, extra=None):
         """A minimal environment: nothing from the requester, only what git/compose need."""
-        env = {'PATH': self.path, 'LANG': 'C.UTF-8', 'GIT_TERMINAL_PROMPT': '0',
-               'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes'}
+        env = {'PATH': self.path, 'LANG': 'C.UTF-8', 'GIT_TERMINAL_PROMPT': '0', 'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes',
+               'NO_COLOR': '1', 'COMPOSE_ANSI': 'never', 'BUILDKIT_PROGRESS': 'plain', 'COMPOSE_PROGRESS': 'plain'}
         for key in ('HOME', 'DOCKER_HOST', 'DOCKER_CONFIG', 'SSH_AUTH_SOCK', 'XDG_RUNTIME_DIR'):
             if os.environ.get(key):
                 env[key] = os.environ[key]
@@ -237,13 +297,190 @@ class Runner:
         self.checker = threading.Thread(target=loop, daemon=True, name='checker')
         self.checker.start()
 
+    # -- jobs --------------------------------------------------------------
+    def submit(self, app_id, action, actor):
+        if app_id not in self.apps:
+            raise RequestError('Unknown app.', 'not_found')
+        if action not in ACTIONS:
+            raise RequestError('Unknown action.')
+        if action in REPO_ACTIONS and not self.apps[app_id]['repo']:
+            raise RequestError('This app has no repository configured.')
+        actor = re.sub(r'[^\x20-\x7e]', '_', str(actor or 'unknown'))[:80]
+        with self.active_lock:
+            if any(h['app'] == app_id and h['action'] == action for h in self.active.values()):
+                raise RequestError(f'A {action} job for this app is already queued or running.', 'conflict')
+            if len(self.active) >= 20:
+                raise RequestError('Too many queued jobs.', 'conflict')
+            handle = {'id': uuid.uuid4().hex, 'app': app_id, 'action': action, 'actor': actor, 'created': time.time(),
+                      'cancelled': threading.Event(), 'proc': None, 'timed_out': False, 'log': None, 'size': 0}
+            self.store.create(handle)
+            self.active[handle['id']] = handle
+        threading.Thread(target=self.execute, args=(handle,), daemon=True, name='job-' + handle['id'][:8]).start()
+        return self.store.job(handle['id'])
+
+    def execute(self, handle):
+        app = self.apps[handle['app']]
+        status, message, exit_code = 'failed', None, None
+        try:
+            with self.app_locks[app['id']], open(self.logs / (handle['id'] + '.log'), 'w', encoding='utf-8') as log:
+                handle['log'] = log
+                if handle['cancelled'].is_set():
+                    raise JobCancelled()
+                self.store.update(handle['id'], status='running', started=time.time())
+                self.write(handle, f"# {handle['action']} {app['id']} by {handle['actor']} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                try:
+                    message = getattr(self, 'do_' + handle['action'])(handle, app)
+                    status = 'succeeded'
+                except RollbackDone as exc:
+                    status, message = 'rolled_back', str(exc)
+                except JobCancelled:
+                    status, message = 'cancelled', 'Cancelled.'
+                except StepFailed as exc:
+                    message, exit_code = str(exc), exc.exit_code
+                except Exception as exc:
+                    message = 'Runner error: ' + type(exc).__name__
+                    print('Job error:', handle['id'], type(exc).__name__, exc, flush=True)
+                self.write(handle, f'# {status}' + (f': {message}' if message else '') + '\n')
+        except JobCancelled:
+            status, message = 'cancelled', 'Cancelled before it started.'
+        finally:
+            handle['log'] = None
+            self.store.update(handle['id'], status=status, message=(message or None) and str(message)[:500], exit_code=exit_code, finished=time.time())
+            with self.active_lock:
+                self.active.pop(handle['id'], None)
+            if app['repo'] and handle['action'] != 'check':
+                self.inspect(app['id'], fetch=False)
+            for old in self.store.prune(self.keep_jobs):
+                (self.logs / (old + '.log')).unlink(missing_ok=True)
+
+    def write(self, handle, text):
+        log = handle['log']
+        if log is None or handle['size'] > self.log_cap:
+            return
+        data = text.encode('utf-8', 'replace')
+        if handle['size'] + len(data) > self.log_cap:
+            data = data[:max(0, self.log_cap - handle['size'])] + b'\n[log truncated at %d bytes]\n' % self.log_cap
+            handle['size'] = self.log_cap + 1
+        else:
+            handle['size'] += len(data)
+        log.write(data.decode('utf-8', 'replace'))
+        log.flush()
+
+    def kill(self, handle, proc, reason):
+        if reason == 'timeout':
+            handle['timed_out'] = True
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
+    def step(self, handle, app, argv, timeout, env=None, check=True, capture=False, cancellable=True):
+        """Run one logged command for a job. argv only ever holds registry values and fixed words."""
+        if cancellable and handle['cancelled'].is_set():
+            raise JobCancelled()
+        self.write(handle, '$ ' + ' '.join(shlex.quote(part) for part in argv) + '\n')
+        try:
+            proc = subprocess.Popen(argv, cwd=app['dir'], env=self.env(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, start_new_session=True, shell=False)
+        except OSError as exc:
+            raise StepFailed(f'{argv[0]} could not start: {exc}')
+        handle['proc'], handle['timed_out'] = (proc if cancellable else None), False
+        timer = threading.Timer(timeout, self.kill, (handle, proc, 'timeout'))
+        timer.daemon = True
+        timer.start()
+        output, kept = [], 0
+        try:
+            for raw in iter(proc.stdout.readline, b''):
+                line = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', raw.decode('utf-8', 'replace'))
+                self.write(handle, line)
+                if capture and kept < 1024 * 1024:
+                    output.append(line)
+                    kept += len(line)
+            code = proc.wait()
+        finally:
+            timer.cancel()
+            handle['proc'] = None
+            proc.stdout.close()
+        prefix = len(self.compose(app))
+        label = 'docker compose ' + argv[prefix] if argv[:2] == ['docker', 'compose'] and len(argv) > prefix else ' '.join(argv[:2])
+        if cancellable and handle['cancelled'].is_set():
+            raise JobCancelled()
+        if handle['timed_out']:
+            raise StepFailed(f'{label} timed out after {timeout:g} s')
+        if code != 0 and check:
+            raise StepFailed(f'{label} exited with status {code}', code)
+        return code, ''.join(output)
+
+    def compose(self, app, *args):
+        argv = ['docker', 'compose', '--project-directory', app['dir'], '-p', app['id']]
+        for path in app['composeFiles']:
+            argv += ['-f', path]
+        return argv + list(args)
+
+    def do_start(self, handle, app):
+        self.step(handle, app, self.compose(app, 'up', '-d'), self.timeouts['lifecycle'])
+
+    def do_stop(self, handle, app):
+        self.step(handle, app, self.compose(app, 'stop'), self.timeouts['lifecycle'])
+
+    def do_restart(self, handle, app):
+        self.step(handle, app, self.compose(app, 'restart'), self.timeouts['lifecycle'])
+
+    def do_check(self, handle, app):
+        self.write(handle, f"$ git fetch {app['repo']['remote']} {app['repo']['branch']} (and compare)\n")
+        result = self.inspect(app['id'], fetch=True)
+        if result.get('error'):
+            raise StepFailed(result['error'])
+        self.write(handle, f"HEAD {result['headShort']} on {result.get('branch') or 'detached HEAD'}; {result['behind']} commit(s) behind, "
+                           f"{result['ahead']} ahead of {result['remoteBranch']}; working tree {'dirty' if result['dirty'] else 'clean'}.\n")
+        for commit in result['commits']:
+            self.write(handle, f"  {commit['sha']} {commit['subject']} ({commit['author']})\n")
+        return f"{result['behind']} commit(s) behind"
+
+    def cancel(self, job_id):
+        with self.active_lock:
+            handle = self.active.get(job_id)
+        if not handle:
+            raise RequestError('Job is not running.', 'conflict' if self.store.row(job_id) else 'not_found')
+        handle['cancelled'].set()
+        proc = handle['proc']
+        if proc:
+            threading.Thread(target=self.kill, args=(handle, proc, 'cancel'), daemon=True).start()
+        return self.store.job(job_id)
+
+    def read_log(self, job_id, offset, limit=64 * 1024):
+        row = self.store.row(job_id)
+        if row is None:
+            raise RequestError('Unknown job.', 'not_found')
+        path = self.logs / (job_id + '.log')
+        data = b''
+        if path.exists():
+            with open(path, 'rb') as file:
+                file.seek(max(0, offset))
+                data = file.read(limit)
+        with self.active_lock:
+            running = job_id in self.active
+        return {'data': data.decode('utf-8', 'replace'), 'offset': max(0, offset) + len(data), 'done': not running, 'status': row['status']}
+
     # -- protocol ----------------------------------------------------------
     def summary(self, app_id):
         app = self.apps[app_id]
         jobs = self.store.jobs(app_id, 1)
+        with self.active_lock:
+            active = [h['id'] for h in self.active.values() if h['app'] == app_id]
+        active_job = next((j for j in (self.store.job(i) for i in active) if j and j['status'] == 'running'), None) or (self.store.job(active[0]) if active else None)
         return {'id': app_id, 'name': app['name'], 'hasRepo': bool(app['repo']), 'mode': app['mode'],
                 'branch': app['repo']['branch'] if app['repo'] else None, 'hasHealthUrl': bool(app['health'] and app['health']['url']),
-                'git': self.store.check(app_id) if app['repo'] else None, 'lastJob': jobs[0] if jobs else None}
+                'git': self.store.check(app_id) if app['repo'] else None, 'lastJob': jobs[0] if jobs else None, 'activeJob': active_job}
+
+    def job_id(self, request):
+        job_id = request.get('id')
+        if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
+            raise RequestError('Invalid job id.')
+        return job_id
 
     def app_id(self, request):
         app_id = request.get('app')
@@ -259,10 +496,37 @@ class Runner:
             return {'apps': [self.summary(app_id) for app_id in self.apps]}
         if op == 'status':
             return {'app': self.summary(self.app_id(request))}
+        if op == 'run':
+            action = request.get('action')
+            if not isinstance(action, str):
+                raise RequestError('Unknown action.')
+            return {'job': self.submit(self.app_id(request), action, request.get('actor'))}
+        if op == 'jobs':
+            limit = request.get('limit', 20)
+            return {'jobs': self.store.jobs(self.app_id(request), limit if isinstance(limit, int) and 0 < limit <= 100 else 20)}
+        if op == 'job':
+            job = self.store.job(self.job_id(request))
+            if not job:
+                raise RequestError('Unknown job.', 'not_found')
+            return {'job': job}
+        if op == 'log':
+            offset = request.get('offset', 0)
+            return self.read_log(self.job_id(request), offset if isinstance(offset, int) and offset >= 0 else 0)
+        if op == 'cancel':
+            return {'job': self.cancel(self.job_id(request))}
         raise RequestError('Unknown operation.')
 
     def close(self):
         self.stop.set()
+        with self.active_lock:
+            handles = list(self.active.values())
+        for handle in handles:
+            handle['cancelled'].set()
+            if handle['proc']:
+                self.kill(handle, handle['proc'], 'cancel')
+        deadline = time.time() + 10
+        while self.active and time.time() < deadline:
+            time.sleep(0.05)
         if self.checker:
             self.checker.join(timeout=5)
         self.store.close()

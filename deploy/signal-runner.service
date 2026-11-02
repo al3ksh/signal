@@ -1,0 +1,43 @@
+# SIGNAL runner: the only SIGNAL process that changes Docker or git state.
+#
+# TRUST BOUNDARY: membership of the docker group is equivalent to root on this host.
+# Anyone who can write to /run/signal-runner/control.sock can start, stop, update and
+# roll back the apps listed in /etc/signal/apps.json, and nothing else. Keep the socket
+# group limited to the SIGNAL web user, and keep /etc/signal/apps.json root-owned (0644).
+[Unit]
+Description=SIGNAL app runner (start, stop, update and roll back registered Compose apps)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=alexpi
+Group=alexpi
+SupplementaryGroups=docker
+WorkingDirectory=/home/alexpi/apps/signal
+ExecStart=/usr/bin/python3 /home/alexpi/apps/signal/runner.py
+Environment=SIGNAL_RUNNER_REGISTRY=/etc/signal/apps.json
+Environment=SIGNAL_RUNNER_DATA_DIR=/var/lib/signal-runner
+Environment=SIGNAL_RUNNER_SOCKET=/run/signal-runner/control.sock
+Environment=SIGNAL_RUNNER_CHECK_INTERVAL=900
+RuntimeDirectory=signal-runner
+RuntimeDirectoryMode=0750
+StateDirectory=signal-runner
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+# A build may be running; give it time to be cancelled and recorded.
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/signal-runner /home/alexpi/apps -/home/alexpi/.docker
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

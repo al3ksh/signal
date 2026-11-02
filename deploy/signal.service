@@ -13,6 +13,9 @@ ExecStart=/usr/bin/python3 /opt/signal/server.py
 Environment=SIGNAL_HOST=127.0.0.1
 Environment=SIGNAL_PORT=8091
 Environment=SIGNAL_DATA_DIR=/var/lib/signal
+# Optional app control (see docs/APP-CONTROL.md). Leave unset to keep SIGNAL read-only.
+#Environment=SIGNAL_CONTROL_SOCKET=/run/signal-runner/control.sock
+#Environment=SIGNAL_CONTROL_ALLOW=100.64.0.0/10,127.0.0.1/32,::1/128,fd7a:115c:a1e0::/48
 StateDirectory=signal
 StateDirectoryMode=0700
 Restart=on-failure
