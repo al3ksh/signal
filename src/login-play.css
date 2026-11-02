@@ -1,20 +1,18 @@
-.signal-tuner{position:absolute;width:min(650px,43vw);aspect-ratio:1;left:55%;top:10%;color:var(--accent);touch-action:none;user-select:none;cursor:grab;border-radius:50%;outline-offset:8px}
-.signal-tuner:active{cursor:grabbing}
-.tuner-dial{width:100%;height:100%;fill:none;stroke:var(--accent-line);stroke-width:1}
-.dial-needle{stroke:var(--accent);stroke-width:2;opacity:.35}
-.dial-dot{fill:var(--accent);opacity:.35}
-.dial-needle,.dial-dot,.tuner-inner-ring{transition:opacity 220ms,stroke 220ms}
-.signal-tuner:hover .dial-needle,.signal-tuner:focus-visible .dial-needle,.signal-tuner.awake .dial-needle{opacity:.75}
-.signal-tuner.locked .dial-needle,.signal-tuner.locked .dial-dot{opacity:1}
-.signal-tuner.locked .tuner-inner-ring{stroke:var(--accent);opacity:.65}
-.tuner-core{position:absolute;inset:36% 25%;display:flex;align-items:center;justify-content:center;flex-direction:column;pointer-events:none}
-.tuner-core svg{width:100%;min-height:35px;fill:none;stroke:currentColor;stroke-width:1.2;opacity:.45;transition:opacity 220ms}
-.tuner-frequency,.tuner-status{font:9px var(--mono);letter-spacing:1.5px;white-space:nowrap;margin-top:12px;opacity:0;transition:opacity 220ms}
-.tuner-status{min-height:12px}
-.signal-tuner:hover .tuner-frequency,.signal-tuner:focus-visible .tuner-frequency,.signal-tuner.awake .tuner-frequency,.signal-tuner.awake .tuner-status{opacity:.7}
-.signal-tuner.locked .tuner-core svg,.signal-tuner.locked .tuner-status{opacity:1}
+.phosphor-scope{position:absolute;width:min(620px,42vw);aspect-ratio:5/4;left:54%;top:14%;color:var(--accent);border:1px solid var(--accent-line);border-radius:7px;cursor:crosshair;user-select:none;touch-action:none;background:radial-gradient(ellipse at center,var(--accent-soft),transparent 72%)}
+.phosphor-scope canvas{position:absolute;inset:0;width:100%;height:100%;border-radius:inherit}
+.scope-graticule{position:absolute;inset:0;width:100%;height:100%;fill:none;stroke:var(--accent-line);stroke-width:1;vector-effect:non-scaling-stroke;opacity:.55}
+.scope-graticule path{vector-effect:non-scaling-stroke}
+.scope-graticule .scope-axis{opacity:1}
+.scope-label{position:absolute;font:9px var(--mono);letter-spacing:1.4px;color:var(--muted);white-space:nowrap;pointer-events:none}
+.scope-label.tl{top:-22px;left:0}.scope-label.tr{top:-22px;right:0}.scope-label.bl{bottom:-22px;left:0}.scope-label.br{bottom:-22px;right:0}
+.scope-status{transition:color 220ms}
+.phosphor-scope.locked .scope-status,.phosphor-scope.busy .scope-status{color:var(--accent)}
+.phosphor-scope.error .scope-status{color:var(--red)}
+.phosphor-scope.locked{border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.phosphor-scope,.phosphor-scope.locked{transition:border-color 300ms}
+.scope-hint{position:absolute;left:54%;top:calc(14% + min(620px,42vw)*.8 + 44px);margin:0;font:8px var(--mono);letter-spacing:1.4px;text-transform:uppercase;color:var(--muted);opacity:.6;pointer-events:none}
 .login-play .login-form{z-index:1}.login-play .login-footer{pointer-events:none}
-@media(max-width:1000px){.signal-tuner{left:53%;top:22%;width:44vw}}
-@media(max-width:640px){.signal-tuner{left:auto;right:20px;top:78px;width:150px;opacity:.7}.tuner-core{inset:30% 14%}.tuner-frequency,.tuner-status{font-size:7px;letter-spacing:0;margin-top:4px}.login-play .login-form{margin-top:155px;margin-bottom:50px}.login-play .login-footer{position:relative;display:block;left:0;bottom:0;padding-bottom:20px}}
-@media(prefers-reduced-motion:reduce){.signal-tuner *{transition:none!important}}
-:root[data-motion=reduced] .signal-tuner *{transition:none!important}
+@media(max-width:1000px){.phosphor-scope{left:52%;top:22%;width:44vw}.scope-hint{left:52%;top:calc(22% + 44vw*.8 + 44px)}}
+@media(max-width:640px){.phosphor-scope{left:auto;right:20px;top:86px;width:160px}.scope-label{font-size:6px;letter-spacing:.4px}.scope-label.tl,.scope-label.tr{top:-14px}.scope-label.bl,.scope-label.br{bottom:-14px}.scope-label.tr,.scope-label.bl{display:none}.scope-hint{display:none}.login-play .login-form{margin-top:170px;margin-bottom:50px}.login-play .login-footer{position:relative;display:block;left:0;bottom:0;padding-bottom:20px}}
+@media(prefers-reduced-motion:reduce){.phosphor-scope *{transition:none!important}}
+:root[data-motion=reduced] .phosphor-scope *{transition:none!important}
