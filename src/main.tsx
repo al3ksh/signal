@@ -14,7 +14,7 @@ import { Services, groupServices } from './Services';
 import { CommandPalette, type CommandItem } from './CommandPalette';
 import { DailyBrief } from './Brief';
 import { LoginPlay } from './LoginPlay';
-import { Apps, useApps, type Action, type ControlState, type Job } from './Apps';
+import { Apps, JobDrawer, useApps, type Action, type ControlState, type Job } from './Apps';
 
 export type Container = { id:string; name:string; image:string; state:string; status:string; project:string; service:string; health:string|null; cpu:number|null; memory:number|null; memoryLimit:number|null; networkRx:number|null; networkTx:number|null; ports:{private:number; public?:number;ip:string;protocol:string}[]; statsError?:boolean; ignoreAlerts?:boolean; monitoringMuted?:boolean; monitoringMuteSource?:'manual'|'label'|'maintenance'|null; maintenanceUntil?:number|null };
 export type HttpCheck = {id:string;service:string;name:string;url:string;source?:'manual'|'label';ok:boolean|null;status:number|null;latency:number|null;checkedAt:number|null;message:string;maintenanceUntil?:number|null};
@@ -105,6 +105,11 @@ function App(){
     {id:'theme',label:'Customize appearance',meta:'Theme and motion',icon:<Palette/>,run:()=>setThemeOpen(true)},
     {id:'refresh',label:'Refresh host data',meta:'Fetch a fresh sample',icon:<ArrowClockwise/>,run:()=>void load(true)},
     ...containers.map(container=>({id:'container-'+container.id,label:container.name,meta:`Container · ${container.project} · ${stateText(container)}`,icon:<Cube/>,run:()=>setSelected(container)})),
+    ...(managed.apps||[]).flatMap(app=>[
+      ...(managed.control?.allowed&&app.hasRepo&&(app.git?.behind||0)>0&&!app.activeJob?[{id:'app-update-'+app.id,label:`Update ${app.name}`,meta:`App · ${app.git?.behind} commits behind ${app.branch}`,icon:<Rocket/>,run:()=>{go('apps');setAppRequest({app:app.id,action:'update' as Action});}}]:[]),
+      ...(managed.control?.allowed&&!app.activeJob?[{id:'app-restart-'+app.id,label:`Restart ${app.name}`,meta:`App · ${app.containers.running}/${app.containers.total} containers running`,icon:<ArrowClockwise/>,run:()=>{go('apps');setAppRequest({app:app.id,action:'restart' as Action});}}]:[]),
+      ...(app.activeJob||app.lastJob?[{id:'app-log-'+app.id,label:`Open job log · ${app.name}`,meta:`App · ${(app.activeJob||app.lastJob)!.action} ${(app.activeJob||app.lastJob)!.status.replace('_',' ')}`,icon:<TerminalWindow/>,run:()=>setOpenJob((app.activeJob||app.lastJob)!)}]:[]),
+    ]),
     ...services.map(service=>({id:'service-'+service.name,label:service.name,meta:`Service · ${service.containers.length} containers · ${service.checks.length} checks`,icon:<Stack/>,run:()=>{setServiceSelected(service.name);go('services');}})),
   ];
   const status=error||stale?'Signal lost':paused?'Observation paused':data?.errors.length?'Docker unavailable':!data?'Connecting to host':attention?`${attention} need attention`:'All systems nominal.';
@@ -130,7 +135,7 @@ function App(){
     </div>}
     <footer className="page-footer"><span><span className="dot"/> {host?.name} <span className="footer-divider">/</span> {host?.kernel}</span><span>READ ONLY <span className="footer-divider">/</span> SAMPLED {time(data.timestamp)} <ArrowUpRight size={13}/></span></footer>
     </>}
-    </main><CommandPalette open={commandOpen} items={commands} onClose={()=>setCommandOpen(false)}/>{themeOpen&&<ThemeEditor theme={theme} onChange={setTheme} onClose={()=>setThemeOpen(false)}/>} {selected&&<Drawer key={selected.id} container={containers.find(c=>c.id===selected.id)||selected} canLogs={canLogs} canManage={hasAuth} onMonitoringUpdate={updateMonitoring} onClose={()=>setSelected(null)}/>} {gateVisible&&<SessionGate error={false} leaving={gateLeaving} onRetry={()=>void checkSession()}/>}
+    </main><CommandPalette open={commandOpen} items={commands} onClose={()=>setCommandOpen(false)}/>{themeOpen&&<ThemeEditor theme={theme} onChange={setTheme} onClose={()=>setThemeOpen(false)}/>} {openJob&&<JobDrawer key={openJob.id} job={openJob} app={managed.apps?.find(app=>app.id===openJob.app)||null} canControl={!!managed.control?.allowed} motion={motion} onClose={()=>setOpenJob(null)} onChanged={()=>void managed.reload()}/>}{selected&&<Drawer key={selected.id} container={containers.find(c=>c.id===selected.id)||selected} canLogs={canLogs} canManage={hasAuth} onMonitoringUpdate={updateMonitoring} onClose={()=>setSelected(null)}/>} {gateVisible&&<SessionGate error={false} leaving={gateLeaving} onRetry={()=>void checkSession()}/>}
   </div>;
 }
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);

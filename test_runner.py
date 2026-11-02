@@ -343,6 +343,213 @@ class LifecycleTests(RunnerCase):
         self.assertEqual(item.summary('demo')['git']['behind'], 1)
 
 
+class UpdateTests(RunnerCase):
+    def make(self, *fixtures, **kwargs):
+        item = self.make_runner(*fixtures, **kwargs)
+        item.health_poll = 0.05
+        return item
+
+    def subs(self, fixture):
+        return [c['sub'] for c in fixture.calls() if 'sub' in c]
+
+    def test_fast_forward_update_builds_deploys_and_records_commits(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        prev = fixture.head()
+        new = fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded', item.read_log(job['id'], 0)['data'])
+        self.assertEqual((job['prevCommit'], job['newCommit'], job['phase']), (prev, new, 'done'))
+        self.assertEqual(fixture.head(), new)
+        self.assertEqual(self.subs(fixture), ['config', 'image', 'build', 'up', 'ps'])
+        build = next(c for c in fixture.calls() if c.get('sub') == 'build')
+        self.assertEqual(build['argv'][-2:], ['build', '--pull'])
+        self.assertEqual(build['env']['SIGNAL_COMMIT'], new)
+        self.assertEqual(build['env']['GIT_TERMINAL_PROMPT'], '0')
+        self.assertIn(['up', '-d', '--remove-orphans'], [c['argv'][-3:] for c in fixture.calls() if c.get('sub') == 'up'])
+        self.assertEqual(item.summary('demo')['git']['head'], new)
+
+    def test_already_up_to_date_is_a_no_op(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded')
+        self.assertIn('up to date', job['message'])
+        self.assertEqual(self.subs(fixture), [])
+
+    def test_dirty_tree_is_refused(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        prev = fixture.head()
+        fixture.push('second')
+        (fixture.dir / 'web' / 'app.txt').write_text('hand edit on the host\n')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('local changes', job['message'])
+        self.assertEqual(fixture.head(), prev)
+        self.assertEqual((fixture.dir / 'web' / 'app.txt').read_text(), 'hand edit on the host\n')
+        self.assertEqual(self.subs(fixture), [])
+
+    def test_diverged_branch_is_refused(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        fixture.push('upstream change')
+        (fixture.dir / 'local.txt').write_text('x\n')
+        git(fixture.dir, 'add', 'local.txt')
+        git(fixture.dir, 'commit', '-q', '-m', 'local only')
+        local = fixture.head()
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('diverged', job['message'])
+        self.assertEqual(fixture.head(), local)
+        self.assertEqual(self.subs(fixture), [])
+
+    def test_wrong_branch_is_refused(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        fixture.push('second')
+        git(fixture.dir, 'checkout', '-q', '-b', 'experiment')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('experiment', job['message'])
+
+    def test_build_failure_rolls_back_to_exact_previous_commit(self):
+        fixture = Fixture(self.root)
+        fixture.configure(fail={'build': 1})
+        item = self.make(fixture)
+        prev = fixture.head()
+        fixture.push('broken')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'rolled_back', item.read_log(job['id'], 0)['data'])
+        self.assertEqual(fixture.head(), prev)
+        self.assertIn(prev[:7], job['message'])
+        self.assertEqual(job['phase'], 'rolled back')
+        # previous images are re-tagged, so the rollback does not rebuild on the Pi
+        self.assertEqual(self.subs(fixture), ['config', 'image', 'build', 'image', 'up', 'ps'])
+        retag = [c['argv'] for c in fixture.calls() if c.get('sub') == 'image']
+        self.assertEqual(retag, [['image', 'tag', 'demo-web', 'demo-web:signal-prev'], ['image', 'tag', 'demo-web:signal-prev', 'demo-web']])
+        up = [c for c in fixture.calls() if c.get('sub') == 'up'][-1]
+        self.assertEqual(up['env']['SIGNAL_COMMIT'], prev)
+
+    def test_rollback_rebuilds_when_previous_images_were_not_saved(self):
+        fixture = Fixture(self.root)
+        fixture.configure(fail={'up': 1, 'image': 1})
+        item = self.make(fixture)
+        prev = fixture.head()
+        fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')  # the rollback's own `up` fails too
+        self.assertIn('rollback', job['message'].lower())
+        self.assertEqual(fixture.head(), prev)
+        self.assertEqual(self.subs(fixture).count('build'), 2)
+
+    def test_health_timeout_rolls_back(self):
+        fixture = Fixture(self.root, health={'timeoutSeconds': 1})
+        fixture.configure(ps='{"Service":"web","State":"running","Health":"unhealthy","ExitCode":0}')
+        item = self.make(fixture)
+        prev = fixture.head()
+        fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')  # still unhealthy after rolling back
+        self.assertIn('web is running/unhealthy', job['message'])
+        self.assertEqual(fixture.head(), prev)
+
+    def test_http_health_check(self):
+        import http.server
+        statuses = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(statuses[0] if statuses else 200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        fixture = Fixture(self.root, health={'url': f'http://127.0.0.1:{httpd.server_port}/', 'expect': 200, 'timeoutSeconds': 1})
+        item = self.make(fixture)
+        fixture.push('second')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        statuses.append(503)
+        prev = fixture.head()
+        fixture.push('third')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('HTTP 503', job['message'])
+        self.assertEqual(fixture.head(), prev)
+
+    def test_exited_one_shot_containers_are_healthy(self):
+        fixture = Fixture(self.root, health={'timeoutSeconds': 1})
+        fixture.configure(ps='{"Service":"web","State":"running","Health":"healthy","ExitCode":0}\n{"Service":"migrate","State":"exited","Health":"","ExitCode":0}')
+        item = self.make(fixture)
+        fixture.push('second')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+
+    def test_compose_ps_array_output(self):
+        fixture = Fixture(self.root, health={'timeoutSeconds': 1})
+        fixture.configure(ps='[{"Service":"web","State":"exited","Health":"","ExitCode":137}]')
+        item = self.make(fixture)
+        fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertIn('web is exited', job['message'])
+
+    def test_manual_rollback_returns_to_commit_before_last_successful_update(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        first = fixture.head()
+        fixture.push('second')
+        self.assertIsNone(item.summary('demo')['rollbackTo'])
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual(item.summary('demo')['rollbackTo'], first[:7])
+        self.assertIsNone(item.summary('demo')['activeJob'])
+        job = wait(item, item.submit('demo', 'rollback', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded', item.read_log(job['id'], 0)['data'])
+        self.assertEqual(fixture.head(), first)
+        self.assertEqual(job['newCommit'], first)
+        # the update's saved images are restored instead of rebuilding
+        self.assertEqual(self.subs(fixture)[-5:], ['config', 'image', 'image', 'up', 'ps'])
+        self.assertEqual(self.subs(fixture).count('build'), 1)
+
+    def test_rollback_without_history_is_refused(self):
+        fixture = Fixture(self.root)
+        item = self.make(fixture)
+        job = wait(item, item.submit('demo', 'rollback', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('No successful update', job['message'])
+
+    def test_cancelled_build_rolls_back(self):
+        fixture = Fixture(self.root)
+        fixture.configure(sleep={'build': 5})
+        item = self.make(fixture)
+        prev = fixture.head()
+        fixture.push('second')
+        job_id = item.submit('demo', 'update', 't')['id']
+        deadline = time.time() + 5
+        while time.time() < deadline and item.store.job(job_id)['phase'] != 'build':
+            time.sleep(0.02)
+        time.sleep(0.2)
+        item.cancel(job_id)
+        job = wait(item, job_id)
+        self.assertEqual(job['status'], 'rolled_back')
+        self.assertEqual(fixture.head(), prev)
+
+    def test_global_build_limit(self):
+        one, two = Fixture(self.root, app_id='one'), Fixture(self.root, app_id='two')
+        one.configure(sleep={'build': 0.5})
+        item = self.make(one, two)
+        one.push('a')
+        two.push('b')
+        jobs = [item.submit('one', 'update', 't')['id'], item.submit('two', 'update', 't')['id']]
+        for job_id in jobs:
+            self.assertEqual(wait(item, job_id)['status'], 'succeeded')
+        calls = one.calls()  # both fixtures share bin/calls.log
+        builds = [c for c in calls if c.get('sub') == 'build']
+        ends = [c['time'] for c in calls if c.get('end') == 'build']
+        self.assertEqual(len(builds), 2)
+        self.assertGreaterEqual(builds[1]['start'], ends[0])
+
+
 class SocketTests(RunnerCase):
     def test_list_status_and_errors_over_unix_socket(self):
         fixture = Fixture(self.root)

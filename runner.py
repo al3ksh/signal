@@ -15,6 +15,8 @@ import sqlite3
 import subprocess
 import threading
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 import uuid
 
 REGISTRY = os.getenv('SIGNAL_RUNNER_REGISTRY', '/etc/signal/apps.json')
@@ -32,6 +34,7 @@ TIMEOUTS = {'lifecycle': 120, 'build': 1800, 'git': GIT_TIMEOUT}
 LOG_CAP = 2 * 1024 * 1024
 KEEP_JOBS = 200
 JOB_ID = re.compile(r'[a-f0-9]{32}')
+IMAGE_REF = re.compile(r'[a-z0-9][a-z0-9._/:-]{0,250}')
 
 
 class RegistryError(ValueError):
@@ -183,6 +186,11 @@ class JobStore:
             self.db.executemany('DELETE FROM jobs WHERE id=?', [(i,) for i in old])
             return old
 
+    def last_update(self, app, status=None):
+        with self.lock:
+            query = "SELECT * FROM jobs WHERE app=? AND action='update'" + (' AND status=? AND prev_commit IS NOT NULL' if status else '') + ' ORDER BY created DESC LIMIT 1'
+            return self.db.execute(query, (app, status) if status else (app,)).fetchone()
+
     def jobs(self, app, limit=20):
         with self.lock:
             return [public_job(r) for r in self.db.execute('SELECT * FROM jobs WHERE app=? ORDER BY created DESC LIMIT ?', (app, limit))]
@@ -217,6 +225,7 @@ class Runner:
         self.active = {}
         self.active_lock = threading.Lock()
         self.build_slot = threading.Semaphore(1)  # one build or pull at a time protects the Pi's RAM
+        self.health_poll = 2.0
         self.path = path or os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')
         self.check_interval = check_interval
         self.app_locks = {app_id: threading.Lock() for app_id in apps}
@@ -234,10 +243,10 @@ class Runner:
         env.update(extra or {})
         return env
 
-    def quiet(self, app, argv, timeout=GIT_TIMEOUT):
-        """Run a short command and return (exit code, stdout). Used by checks, never logged to a job."""
+    def quiet(self, app, argv, timeout=GIT_TIMEOUT, env=None):
+        """Run a short command and return (exit code, stdout, stderr). Used by checks, never logged to a job."""
         try:
-            done = subprocess.run(argv, cwd=app['dir'], env=self.env(), capture_output=True, text=True,
+            done = subprocess.run(argv, cwd=app['dir'], env=self.env(env), capture_output=True, text=True,
                                   timeout=timeout, check=False, shell=False)
             return done.returncode, done.stdout.strip(), done.stderr.strip()
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -345,13 +354,15 @@ class Runner:
             status, message = 'cancelled', 'Cancelled before it started.'
         finally:
             handle['log'] = None
-            self.store.update(handle['id'], status=status, message=(message or None) and str(message)[:500], exit_code=exit_code, finished=time.time())
-            with self.active_lock:
-                self.active.pop(handle['id'], None)
-            if app['repo'] and handle['action'] != 'check':
-                self.inspect(app['id'], fetch=False)
-            for old in self.store.prune(self.keep_jobs):
-                (self.logs / (old + '.log')).unlink(missing_ok=True)
+            try:
+                if app['repo'] and handle['action'] != 'check':
+                    self.inspect(app['id'], fetch=False)
+            finally:
+                self.store.update(handle['id'], status=status, message=(message or None) and str(message)[:500], exit_code=exit_code, finished=time.time())
+                for old in self.store.prune(self.keep_jobs):
+                    (self.logs / (old + '.log')).unlink(missing_ok=True)
+                with self.active_lock:
+                    self.active.pop(handle['id'], None)
 
     def write(self, handle, text):
         log = handle['log']
@@ -440,6 +451,193 @@ class Runner:
             self.write(handle, f"  {commit['sha']} {commit['subject']} ({commit['author']})\n")
         return f"{result['behind']} commit(s) behind"
 
+    # -- update and rollback ----------------------------------------------
+    def phase(self, handle, name):
+        self.store.update(handle['id'], phase=name)
+        self.write(handle, f'# phase: {name}\n')
+
+    def jgit(self, handle, app, *args, check=True, cancellable=True):
+        code, out = self.step(handle, app, ['git', *args], self.timeouts['git'], check=check, capture=True, cancellable=cancellable)
+        return out.strip() if code == 0 else None
+
+    def preflight(self, handle, app):
+        """Only a clean checkout of the configured branch may move."""
+        branch = self.jgit(handle, app, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
+        if branch != app['repo']['branch']:
+            raise StepFailed(f"Checked out {branch or 'a detached HEAD'}, but the registry expects {app['repo']['branch']}. Refusing to deploy.")
+        if self.jgit(handle, app, 'status', '--porcelain', '--untracked-files=no'):
+            raise StepFailed('The working tree has local changes. Refusing to update; commit, stash or discard them on the host first.')
+
+    @staticmethod
+    def commit_env(commit):
+        # Compose files may pin CI images with ${SIGNAL_COMMIT:-main}; harmless when unused.
+        return {'SIGNAL_COMMIT': commit} if commit else {}
+
+    def head(self, app):
+        code, out, _ = self.quiet(app, ['git', 'rev-parse', 'HEAD'])
+        return out if code == 0 else None
+
+    def save_images(self, handle, app, commit):
+        """Tag the images of the running commit as <name>:signal-prev so a rollback needs no rebuild or pull."""
+        code, out = self.step(handle, app, self.compose(app, 'config', '--images'), 60, env=self.commit_env(commit), check=False, capture=True)
+        pairs, names = [], set()
+        for image in sorted(set(out.split())) if code == 0 else []:
+            if '@' in image or not IMAGE_REF.fullmatch(image):
+                continue
+            last = image.rsplit('/', 1)[-1]
+            name = image.rsplit(':', 1)[0] if ':' in last else image
+            if name in names:
+                continue
+            names.add(name)
+            if self.step(handle, app, ['docker', 'image', 'tag', image, name + ':signal-prev'], 60, check=False)[0] == 0:
+                pairs.append([image, name + ':signal-prev'])
+        return pairs
+
+    def restore_images(self, handle, app, pairs):
+        if not pairs:
+            return False
+        ok = True
+        for image, backup in pairs:
+            ok = self.step(handle, app, ['docker', 'image', 'tag', backup, image], 60, check=False, cancellable=False)[0] == 0 and ok
+        return ok
+
+    def build(self, handle, app, commit, cancellable=True):
+        """Build on the host or pull CI images, one at a time across all apps."""
+        if not self.build_slot.acquire(blocking=False):
+            self.write(handle, '# waiting for another build to finish\n')
+            while not self.build_slot.acquire(timeout=0.5):
+                if cancellable and handle['cancelled'].is_set():
+                    raise JobCancelled()
+        try:
+            args = ('pull',) if app['mode'] == 'pull' else ('build', '--pull')
+            self.step(handle, app, self.compose(app, *args), self.timeouts['build'], env=self.commit_env(commit), cancellable=cancellable)
+        finally:
+            self.build_slot.release()
+
+    def health_problem(self, app, commit):
+        code, out, err = self.quiet(app, self.compose(app, 'ps', '-a', '--format', 'json'), 60, env=self.commit_env(commit))
+        if code != 0:
+            return 'docker compose ps failed: ' + (err or out)[-200:]
+        try:
+            text = out.strip()
+            rows = json.loads(text) if text.startswith('[') else [json.loads(line) for line in text.splitlines() if line.strip()]
+        except ValueError:
+            return 'docker compose ps returned unreadable output'
+        if not rows:
+            return 'no containers exist'
+        for row in rows:
+            state, health = str(row.get('State', '')).lower(), str(row.get('Health', '')).lower()
+            if state == 'exited' and row.get('ExitCode') == 0:
+                continue  # finished one-shot service (migrations, init)
+            if state != 'running' or health in ('unhealthy', 'starting'):
+                return f"{row.get('Service') or row.get('Name') or 'a container'} is {state}{'/' + health if health else ''}"
+        url = (app['health'] or {}).get('url')
+        if url:
+            expect = app['health']['expect']
+            try:
+                with urlopen(Request(url, headers={'User-Agent': 'SIGNAL-runner'}), timeout=5) as response:
+                    status = response.status
+            except HTTPError as exc:
+                status = exc.code
+            except (URLError, OSError, ValueError) as exc:
+                return f'{url} is unreachable ({getattr(exc, "reason", exc)})'
+            if status != expect:
+                return f'{url} answered HTTP {status}, expected {expect}'
+        return None
+
+    def health(self, handle, app, commit, cancellable=True):
+        timeout = (app['health'] or {}).get('timeoutSeconds', 60)
+        url = (app['health'] or {}).get('url')
+        self.write(handle, f"# waiting up to {timeout} s for running containers{' and ' + url if url else ''}\n")
+        deadline, problem = time.monotonic() + timeout, None
+        while True:
+            if cancellable and handle['cancelled'].is_set():
+                raise JobCancelled()
+            problem = self.health_problem(app, commit)
+            if problem is None:
+                self.write(handle, '# healthy\n')
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StepFailed(f'Health check failed after {timeout} s: {problem}')
+            time.sleep(min(self.health_poll, remaining))
+
+    def deploy(self, handle, app, prev, move, artifacts):
+        """Move the checkout, produce images, start and verify. Any failure after the move restores prev."""
+        images = self.save_images(handle, app, prev)
+        self.store.update(handle['id'], prev_commit=prev, images=json.dumps(images))
+        move()
+        new = self.head(app)
+        self.store.update(handle['id'], new_commit=new)
+        try:
+            artifacts(new)
+            self.phase(handle, 'up')
+            self.step(handle, app, self.compose(app, 'up', '-d', '--remove-orphans'), self.timeouts['lifecycle'], env=self.commit_env(new))
+            self.phase(handle, 'health')
+            self.health(handle, app, new)
+        except (StepFailed, JobCancelled) as exc:
+            self.restore(handle, app, prev, images, 'Cancelled' if isinstance(exc, JobCancelled) else str(exc))
+        self.phase(handle, 'done')
+        return new
+
+    def restore(self, handle, app, prev, images, reason):
+        self.phase(handle, 'rollback')
+        self.write(handle, f'# {reason}\n# rolling back to {prev[:12]}\n')
+        try:
+            self.step(handle, app, ['git', 'reset', '--hard', prev], self.timeouts['git'], cancellable=False)
+            if not self.restore_images(handle, app, images) and app['mode'] == 'build':
+                self.build(handle, app, prev, cancellable=False)
+            self.step(handle, app, self.compose(app, 'up', '-d', '--remove-orphans'), self.timeouts['lifecycle'], env=self.commit_env(prev), cancellable=False)
+            self.health(handle, app, prev, cancellable=False)
+        except StepFailed as exc:
+            raise StepFailed(f'{reason}. The rollback to {prev[:7]} also failed: {exc}')
+        self.phase(handle, 'rolled back')
+        raise RollbackDone(f'{reason}. Rolled back to {prev[:7]}.')
+
+    def do_update(self, handle, app):
+        repo = app['repo']
+        upstream = repo['remote'] + '/' + repo['branch']
+        self.phase(handle, 'fetch')
+        self.jgit(handle, app, 'fetch', '--no-tags', repo['remote'], repo['branch'])
+        self.preflight(handle, app)
+        prev = self.jgit(handle, app, 'rev-parse', 'HEAD')
+        target = self.jgit(handle, app, 'rev-parse', upstream)
+        if int(self.jgit(handle, app, 'rev-list', '--count', upstream + '..HEAD')):
+            raise StepFailed(f'The checkout has diverged from {upstream} (local commits not on the remote). Only fast-forward updates are allowed.')
+        if prev == target:
+            self.phase(handle, 'done')
+            return f'Already up to date with {upstream} at {prev[:7]}.'
+        def artifacts(commit):
+            self.phase(handle, 'pull' if app['mode'] == 'pull' else 'build')
+            self.build(handle, app, commit)
+        new = self.deploy(handle, app, prev, lambda: self.jgit(handle, app, 'merge', '--ff-only', upstream), artifacts)
+        return f'Deployed {new[:7]} (was {prev[:7]}).'
+
+    def do_rollback(self, handle, app):
+        row = self.store.last_update(app['id'], 'succeeded')
+        if row is None:
+            raise StepFailed('No successful update to roll back.')
+        target = row['prev_commit']
+        self.phase(handle, 'fetch')
+        self.preflight(handle, app)
+        prev = self.jgit(handle, app, 'rev-parse', 'HEAD')
+        if prev == target:
+            self.phase(handle, 'done')
+            return f'Already at {target[:7]}.'
+        if self.jgit(handle, app, 'cat-file', '-e', target + '^{commit}', check=False) is None:
+            raise StepFailed(f'Commit {target[:7]} is no longer in the repository.')
+        latest = self.store.last_update(app['id'])
+        saved = json.loads(row['images'] or '[]') if latest is not None and latest['id'] == row['id'] else []
+        def artifacts(commit):
+            # The images of the commit before the last update are still tagged :signal-prev unless a later update replaced them.
+            if self.restore_images(handle, app, saved):
+                return
+            if app['mode'] == 'build':
+                self.phase(handle, 'build')
+                self.build(handle, app, commit)
+        self.deploy(handle, app, prev, lambda: self.jgit(handle, app, 'reset', '--hard', target), artifacts)
+        return f'Rolled back to {target[:7]} (was {prev[:7]}).'
+
     def cancel(self, job_id):
         with self.active_lock:
             handle = self.active.get(job_id)
@@ -471,8 +669,10 @@ class Runner:
         jobs = self.store.jobs(app_id, 1)
         with self.active_lock:
             active = [h['id'] for h in self.active.values() if h['app'] == app_id]
-        active_job = next((j for j in (self.store.job(i) for i in active) if j and j['status'] == 'running'), None) or (self.store.job(active[0]) if active else None)
-        return {'id': app_id, 'name': app['name'], 'hasRepo': bool(app['repo']), 'mode': app['mode'],
+        pending = [j for j in (self.store.job(i) for i in active) if j and j['status'] in ('queued', 'running')]
+        active_job = next((j for j in pending if j['status'] == 'running'), pending[0] if pending else None)
+        rollback = self.store.last_update(app_id, 'succeeded') if app['repo'] else None
+        return {'rollbackTo': rollback['prev_commit'][:7] if rollback else None,'id': app_id, 'name': app['name'], 'hasRepo': bool(app['repo']), 'mode': app['mode'],
                 'branch': app['repo']['branch'] if app['repo'] else None, 'hasHealthUrl': bool(app['health'] and app['health']['url']),
                 'git': self.store.check(app_id) if app['repo'] else None, 'lastJob': jobs[0] if jobs else None, 'activeJob': active_job}
 
