@@ -104,7 +104,7 @@ All commands run with `cwd` set to the app directory and `docker compose --proje
 | Stop | `stop` |
 | Restart | `restart` |
 | Check now | `git fetch --no-tags <remote> <branch>`, then compare: deployed commit, commits behind (up to 20 listed), ahead, current branch, local changes. |
-| Update | fetch → refuse if not on the configured branch, if tracked files have local changes, or if the checkout has commits the remote does not (only fast-forwards) → no-op if already current → tag the images of the running commit `<image>:signal-prev` → `git merge --ff-only` → **build** (`build --pull`, only changed services, see below) or **pull** → `up -d --remove-orphans` → health. |
+| Update | fetch → refuse if not on the configured branch, in pull mode refuse while CI has not published the images for the new commit, if tracked files have local changes, or if the checkout has commits the remote does not (only fast-forwards) → no-op if already current → tag the images of the running commit `<image>:signal-prev` → `git merge --ff-only` → **build** (`build --pull`, only changed services, see below) or **pull** → `up -d --remove-orphans` → health. |
 | Roll back | Returns to the commit that was running before the last **successful** update (`git reset --hard` to that exact recorded commit), restores its `:signal-prev` images when they are still the latest saved ones (otherwise rebuilds in build mode), `up -d`, health. |
 
 **Health** passes when every project container is running and not `unhealthy`/`starting` (exited containers with exit code 0 count as finished one-shot services), and, if configured, the health URL answers the expected status. It is polled every 2 s until `timeoutSeconds`.
@@ -132,7 +132,7 @@ services:
     # keep `build:` only if you still want to be able to build locally
 ```
 
-and in `/etc/signal/apps.json` set `"update": {"mode": "pull"}`. Update now runs `docker compose pull` + `up -d`: seconds instead of minutes. Because the runner passes the deployed commit as `SIGNAL_COMMIT`, the Pi pulls exactly the image built for that commit, and a rollback returns to the previous commit's image (still local, re-tagged from `:signal-prev`). Wait for the Actions run to finish before pressing **Update**; if the image for the new commit does not exist yet, the pull fails and the update rolls back cleanly.
+and in `/etc/signal/apps.json` set `"update": {"mode": "pull"}`. Update now runs `docker compose pull` + `up -d`: seconds instead of minutes. Because the runner passes the deployed commit as `SIGNAL_COMMIT`, the Pi pulls exactly the image built for that commit, and a rollback returns to the previous commit's image (still local, re-tagged from `:signal-prev`). Before moving the checkout, the runner asks the registry (`docker manifest inspect`) whether every image pinned to the new commit exists. If the Actions run has not finished yet, the update stops with "…is not published yet" and nothing changes; press **Update** again once CI is green.
 
 Private packages: on the Pi run `docker login ghcr.io` as `alexpi` once with a token that has `read:packages`. The runner reads `~/.docker/config.json`.
 

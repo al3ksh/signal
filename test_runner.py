@@ -19,7 +19,7 @@ try:
 except (OSError, ValueError):
     config = {}
 args = sys.argv[1:]
-sub = next((a for a in args if a in ('build', 'pull', 'up', 'stop', 'restart', 'ps', 'config', 'image')), '')
+sub = next((a for a in args if a in ('build', 'pull', 'up', 'stop', 'restart', 'ps', 'config', 'image', 'manifest')), '')
 with open(os.path.join(here, 'calls.log'), 'a') as log:
     log.write(json.dumps({'argv': args, 'sub': sub, 'start': time.time(), 'env': {k: os.environ.get(k) for k in ('SIGNAL_COMMIT', 'GIT_TERMINAL_PROMPT')}}) + '\n')
 time.sleep(config.get('sleep', {}).get(sub, 0))
@@ -30,7 +30,7 @@ if sub == 'ps':
 elif sub == 'config' and '--format' in args:
     print(config.get('configJson', '{"services": {}}'))
 elif sub == 'config':
-    print(config.get('images', 'demo-web'))
+    print(config.get('images', 'demo-web').replace('{commit}', os.environ.get('SIGNAL_COMMIT') or 'none'))
 elif sub in config.get('output', {}):
     print(config['output'][sub])
 fail = config.get('fail', {})
@@ -648,7 +648,7 @@ class SpeedTests(RunnerCase):
         new = fixture.push('second')
         job = wait(item, item.submit('demo', 'update', 't')['id'])
         self.assertEqual(job['status'], 'succeeded', item.read_log(job['id'], 0)['data'])
-        self.assertEqual(self.subs(fixture), ['config', 'image', 'pull', 'up', 'ps'])
+        self.assertEqual(self.subs(fixture), ['config', 'config', 'config', 'image', 'pull', 'up', 'ps'])  # fixed tag: nothing to pre-check
         pull = next(c for c in fixture.calls() if c.get('sub') == 'pull')
         self.assertEqual(pull['env']['SIGNAL_COMMIT'], new)
         self.assertEqual(next(c for c in fixture.calls() if c.get('sub') == 'image')['argv'], ['image', 'tag', 'ghcr.io/al3ksh/demo:abc', 'ghcr.io/al3ksh/demo:signal-prev'])
@@ -664,6 +664,28 @@ class SpeedTests(RunnerCase):
         self.assertEqual(fixture.head(), prev)
         self.assertNotIn('build', self.subs(fixture))
         self.assertEqual(self.subs(fixture)[-3:], ['image', 'up', 'ps'])
+
+    def test_pull_mode_refuses_before_ci_published_the_image(self):
+        fixture = Fixture(self.root, mode='pull')
+        fixture.configure(images='ghcr.io/al3ksh/demo:{commit}', fail={'manifest': 1})
+        item = self.make(fixture)
+        prev = fixture.head()
+        new = fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'failed')
+        self.assertIn('ghcr.io/al3ksh/demo:' + new, job['message'])
+        self.assertIn('not published yet', job['message'])
+        self.assertEqual(fixture.head(), prev)
+        self.assertNotIn('pull', self.subs(fixture))
+        self.assertNotIn('image', self.subs(fixture))
+
+    def test_pull_mode_checks_the_commit_pinned_image(self):
+        fixture = Fixture(self.root, mode='pull')
+        fixture.configure(images='ghcr.io/al3ksh/demo:{commit}\npostgres:16')
+        item = self.make(fixture)
+        new = fixture.push('second')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual([c['argv'] for c in fixture.calls() if c.get('sub') == 'manifest'], [['manifest', 'inspect', 'ghcr.io/al3ksh/demo:' + new]])
 
     def two_service_fixture(self):
         fixture = Fixture(self.root)
