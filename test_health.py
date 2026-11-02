@@ -75,6 +75,9 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(health.mount_for(self.tree.proc, '/boot/firmware/config.txt')['device'], '/dev/mmcblk0p1')
         self.tree.write('proc/mounts', '/dev/mmcblk0p2 / ext4 ro,noatime 0 0\n')
         self.assertTrue(health.mount_for(self.tree.proc, '/')['readOnly'])
+        # systemd's ProtectSystem=strict makes / look ro in our namespace; init's view wins
+        self.tree.write('proc/1/mounts', '/dev/mmcblk0p2 / ext4 rw,noatime 0 0\n')
+        self.assertFalse(health.mount_for(self.tree.proc, '/')['readOnly'])
         stats = health.ext4_stats(self.tree.sys, '/dev/root')  # older Pi OS reports /dev/root
         self.assertEqual((stats['device'], stats['errors'], stats['lifetimeWriteKbytes']), ('mmcblk0p2', 0, 508000000))
         self.assertIsNone(health.ext4_stats(self.tree.root / 'nothing', '/dev/sda1'))

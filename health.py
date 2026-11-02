@@ -67,9 +67,10 @@ def core_volts(run=command):
 
 
 def mount_for(proc_root, path='/'):
-    """The /proc/mounts entry that holds path (longest mount-point prefix)."""
+    """The mount entry that holds path (longest mount-point prefix). Reads init's view (/proc/1/mounts) first:
+    under ProtectSystem=strict our own namespace shows / as ro even when the card is fine."""
     best = None
-    for line in (text(Path(proc_root) / 'mounts') or '').splitlines():
+    for line in (text(Path(proc_root) / '1' / 'mounts') or text(Path(proc_root) / 'mounts') or '').splitlines():
         fields = line.split()
         if len(fields) < 4:
             continue
