@@ -4,12 +4,14 @@ It listens on a Unix socket for newline-delimited JSON. A request names an app f
 (/etc/signal/apps.json) and an operation from a fixed set; no request field ever becomes part of a
 command line. Commands run as argv lists (shell=False) with cwd set to the app directory.
 """
+import grp
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import signal
+import socket
 import socketserver
 import sqlite3
 import subprocess
@@ -23,6 +25,11 @@ REGISTRY = os.getenv('SIGNAL_RUNNER_REGISTRY', '/etc/signal/apps.json')
 DATA_DIR = os.getenv('SIGNAL_RUNNER_DATA_DIR', '/var/lib/signal-runner')
 SOCKET_PATH = os.getenv('SIGNAL_RUNNER_SOCKET', '/run/signal-runner/control.sock')
 CHECK_INTERVAL = int(os.getenv('SIGNAL_RUNNER_CHECK_INTERVAL', '900'))
+SOCKET_GROUP = os.getenv('SIGNAL_RUNNER_SOCKET_GROUP') or None
+DOCKER_PROXY = os.getenv('SIGNAL_RUNNER_DOCKER_PROXY') or None
+DOCKER_SOCKET = os.getenv('DOCKER_SOCKET', '/var/run/docker.sock')
+# Exactly the Docker Engine reads SIGNAL's web server makes, nothing else.
+DOCKER_READ = re.compile(r'/(?:v1\.\d{2}/)?(?:_ping|version|containers/json|containers/[a-f0-9]{12,64}/(?:json|stats|logs))(?:\?[A-Za-z0-9=&_.-]{0,300})?')
 APP_ID = re.compile(r'[a-z0-9-]{1,40}')
 REMOTE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,39}')
 BRANCH = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
@@ -889,18 +896,80 @@ class SocketServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
 
-def serve(runner, path):
+def bind(path, handler, group=None):
+    """A Unix socket created 0660 from the start, optionally handed to a group shared with the web user."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
     old = os.umask(0o117)
     try:
-        server = SocketServer(str(path), SocketHandler)
+        server = SocketServer(str(path), handler)
     finally:
         os.umask(old)
     os.chmod(path, 0o660)
+    if group:
+        try:
+            os.chown(path, -1, grp.getgrnam(group).gr_gid)
+        except (KeyError, OSError) as exc:
+            server.server_close()
+            raise SystemExit(f'Cannot give {path} to group {group}: {exc}')
+    return server
+
+
+def serve(runner, path, group=None):
+    server = bind(path, SocketHandler, group)
     server.runner = runner
+    return server
+
+
+class DockerProxyHandler(socketserver.BaseRequestHandler):
+    """Read-only Docker socket for SIGNAL's web server. Only GET requests to the allow-listed reads pass;
+    the request is rebuilt from the validated target, so no client header or body ever reaches Docker."""
+    def handle(self):
+        self.request.settimeout(10)
+        data = b''
+        try:
+            while b'\r\n\r\n' not in data:
+                chunk = self.request.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+                if len(data) > 16384:
+                    return self.deny()
+        except OSError:
+            return
+        head, _, rest = data.partition(b'\r\n\r\n')
+        lines = head.decode('latin-1').split('\r\n')
+        parts = lines[0].split(' ')
+        headers = {line.partition(':')[0].strip().lower() for line in lines[1:]}
+        if (len(parts) != 3 or parts[0] != 'GET' or not parts[2].startswith('HTTP/1.') or rest
+                or headers & {'content-length', 'transfer-encoding', 'upgrade'} or not DOCKER_READ.fullmatch(parts[1])):
+            return self.deny()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
+                upstream.settimeout(30)
+                upstream.connect(self.server.docker_socket)
+                upstream.sendall(f'GET {parts[1]} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n'.encode())
+                while True:
+                    chunk = upstream.recv(65536)
+                    if not chunk:
+                        break
+                    self.request.sendall(chunk)
+        except OSError:
+            return
+
+    def deny(self):
+        body = b'{"message":"Refused by the SIGNAL read-only Docker proxy."}'
+        try:
+            self.request.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(body) + body)
+        except OSError:
+            pass
+
+
+def serve_docker_proxy(path, docker_socket=DOCKER_SOCKET, group=None):
+    server = bind(path, DockerProxyHandler, group)
+    server.docker_socket = docker_socket
     return server
 
 
@@ -911,11 +980,17 @@ def main():
         raise SystemExit('Refusing to start: ' + str(exc))
     runner = Runner(apps, DATA_DIR)
     runner.start_checker()
-    server = serve(runner, SOCKET_PATH)
+    server = serve(runner, SOCKET_PATH, SOCKET_GROUP)
     print(f'SIGNAL runner managing {len(apps)} apps on {SOCKET_PATH}', flush=True)
-    import signal
+    proxy = None
+    if DOCKER_PROXY:
+        proxy = serve_docker_proxy(DOCKER_PROXY, DOCKER_SOCKET, SOCKET_GROUP)
+        threading.Thread(target=proxy.serve_forever, daemon=True, name='docker-proxy').start()
+        print(f'Read-only Docker proxy on {DOCKER_PROXY}', flush=True)
     def shutdown(signum, frame):
         threading.Thread(target=server.shutdown, daemon=True).start()
+        if proxy:
+            threading.Thread(target=proxy.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     try:

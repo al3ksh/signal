@@ -20,8 +20,13 @@ Environment=SIGNAL_RUNNER_REGISTRY=/etc/signal/apps.json
 Environment=SIGNAL_RUNNER_DATA_DIR=/var/lib/signal-runner
 Environment=SIGNAL_RUNNER_SOCKET=/run/signal-runner/control.sock
 Environment=SIGNAL_RUNNER_CHECK_INTERVAL=900
+# Hardening (docs/APP-CONTROL.md, "Run SIGNAL without Docker access"): hand the sockets to a
+# group shared with a separate SIGNAL user and serve it a GET-only Docker socket.
+#Environment=SIGNAL_RUNNER_SOCKET_GROUP=signal-control
+#Environment=SIGNAL_RUNNER_DOCKER_PROXY=/run/signal-runner/docker-ro.sock
 RuntimeDirectory=signal-runner
-RuntimeDirectoryMode=0750
+# Sockets inside are 0660; the directory only needs to be traversable.
+RuntimeDirectoryMode=0755
 StateDirectory=signal-runner
 StateDirectoryMode=0700
 Restart=on-failure

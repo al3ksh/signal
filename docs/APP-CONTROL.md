@@ -94,6 +94,68 @@ These steps assume the native install described in [INSTALLATION.md](INSTALLATIO
 
 To turn control off again, remove `SIGNAL_CONTROL_SOCKET` and restart `signal.service`; stop the runner with `sudo systemctl disable --now signal-runner`.
 
+## Run SIGNAL without Docker access (recommended hardening)
+
+Out of the box both processes run as `alexpi`. If `alexpi` is in the `docker` group, the web server *could* change Docker; that it only sends GET requests is a property of its code, not of the OS. To make the boundary real, run the web server as its own user with no Docker access and let the runner serve it a **read-only Docker socket**: the runner forwards only `GET` requests to the exact endpoints SIGNAL reads (`/version`, `/_ping`, `/containers/json`, `/containers/<id>/json|stats|logs`), rebuilds each request from the validated path, and answers everything else (`POST`, `DELETE`, `exec`, images, bodies, upgrades, pipelining) with 403 before Docker sees it.
+
+1. Create a group for the two sockets and a system user for the web server; put the runner user in the group:
+
+   ```sh
+   sudo groupadd --system signal-control
+   sudo useradd --system --home-dir /var/lib/signal --shell /usr/sbin/nologin --groups signal-control signal
+   sudo usermod -aG signal-control alexpi
+   ```
+
+2. Move what SIGNAL reads out of the home directory (Raspberry Pi OS home directories are private) and hand it over:
+
+   ```sh
+   sudo install -d -o alexpi -g alexpi -m 0755 /opt/signal
+   rsync -a /home/alexpi/apps/signal/ /opt/signal/      # code and dist/, later via SIGNAL_DEPLOY_DIR=/opt/signal deploy/update-signal.sh
+   sudo install -o root -g signal -m 0640 /home/alexpi/.config/signal/access.json /etc/signal/access.json
+   sudo chown -R signal:signal /var/lib/signal
+   ```
+
+3. Runner (`sudo systemctl edit signal-runner`): keep `User=alexpi`, then
+
+   ```ini
+   [Service]
+   Environment=SIGNAL_RUNNER_SOCKET_GROUP=signal-control
+   Environment=SIGNAL_RUNNER_DOCKER_PROXY=/run/signal-runner/docker-ro.sock
+   ExecStart=
+   ExecStart=/usr/bin/python3 /opt/signal/runner.py
+   WorkingDirectory=/opt/signal
+   ```
+
+4. Web server (`sudo systemctl edit signal`):
+
+   ```ini
+   [Unit]
+   Wants=signal-runner.service
+   After=signal-runner.service
+
+   [Service]
+   User=signal
+   Group=signal
+   SupplementaryGroups=
+   SupplementaryGroups=signal-control
+   Environment=DOCKER_SOCKET=/run/signal-runner/docker-ro.sock
+   Environment=SIGNAL_AUTH_FILE=/etc/signal/access.json
+   Environment=SIGNAL_CONTROL_SOCKET=/run/signal-runner/control.sock
+   WorkingDirectory=/opt/signal
+   ExecStart=
+   ExecStart=/usr/bin/python3 /opt/signal/server.py
+   ```
+
+5. `sudo systemctl daemon-reload && sudo systemctl restart signal-runner signal`, then verify:
+
+   ```sh
+   sudo -u signal docker ps                                                     # permission denied: no Docker access
+   sudo -u signal curl -s --unix-socket /run/signal-runner/docker-ro.sock http://d/v1.44/containers/json | head -c 80   # works
+   sudo -u signal curl -s -X POST --unix-socket /run/signal-runner/docker-ro.sock http://d/v1.44/containers/x/restart  # 403
+   ```
+
+Trade-off: while the runner is stopped, SIGNAL shows "Docker unavailable" because its Docker reads go through the runner. Host telemetry keeps working.
+
 ## What each action does
 
 All commands run with `cwd` set to the app directory and `docker compose --project-directory <dir> -p <id> -f <file>…`.
@@ -162,6 +224,9 @@ SIGNAL is not Compose-managed on this host and the runner does not manage it. Us
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `SIGNAL_RUNNER_SOCKET_GROUP` | Unset (runner's group) | Group that owns both sockets, e.g. `signal-control`. |
+| `SIGNAL_RUNNER_DOCKER_PROXY` | Unset (off) | Path for the read-only Docker socket, e.g. `/run/signal-runner/docker-ro.sock`. |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker socket the proxy forwards to. |
 | `SIGNAL_RUNNER_REGISTRY` | `/etc/signal/apps.json` | App registry. |
 | `SIGNAL_RUNNER_DATA_DIR` | `/var/lib/signal-runner` | `jobs.db` and job logs. |
 | `SIGNAL_RUNNER_SOCKET` | `/run/signal-runner/control.sock` | Control socket (created `0660`). |
