@@ -413,10 +413,12 @@ class Runner:
                 if app['repo'] and handle['action'] != 'check':
                     self.inspect(app['id'], fetch=False)
             finally:
-                self.store.update(handle['id'], status=status, message=(message or None) and str(message)[:500], exit_code=exit_code, finished=time.time())
-                for old in self.store.prune(self.keep_jobs):
-                    (self.logs / (old + '.log')).unlink(missing_ok=True)
+                # Finishing and leaving the active set happen together: whoever sees the final status
+                # can submit the same action again without a spurious conflict.
                 with self.active_lock:
+                    self.store.update(handle['id'], status=status, message=(message or None) and str(message)[:500], exit_code=exit_code, finished=time.time())
+                    for old in self.store.prune(self.keep_jobs):
+                        (self.logs / (old + '.log')).unlink(missing_ok=True)
                     self.active.pop(handle['id'], None)
 
     def write(self, handle, text):
