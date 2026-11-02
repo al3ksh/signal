@@ -5,6 +5,7 @@ It listens on a Unix socket for newline-delimited JSON. A request names an app f
 command line. Commands run as argv lists (shell=False) with cwd set to the app directory.
 """
 import grp
+import http.client
 import json
 import os
 from pathlib import Path
@@ -28,8 +29,19 @@ CHECK_INTERVAL = int(os.getenv('SIGNAL_RUNNER_CHECK_INTERVAL', '900'))
 SOCKET_GROUP = os.getenv('SIGNAL_RUNNER_SOCKET_GROUP') or None
 DOCKER_PROXY = os.getenv('SIGNAL_RUNNER_DOCKER_PROXY') or None
 DOCKER_SOCKET = os.getenv('DOCKER_SOCKET', '/var/run/docker.sock')
-# Exactly the Docker Engine reads SIGNAL's web server makes, nothing else.
-DOCKER_READ = re.compile(r'/(?:v1\.\d{2}/)?(?:_ping|version|containers/json|containers/[a-f0-9]{12,64}/(?:json|stats|logs))(?:\?[A-Za-z0-9=&_.-]{0,300})?')
+# Exactly the Docker Engine reads SIGNAL's web server makes, nothing else. Queries are parsed and rebuilt.
+DOCKER_READ = re.compile(r'/(v1\.\d{2}/)?(_ping|version|containers/json|containers/([a-f0-9]{12,64})/(json|stats|logs))(?:\?([A-Za-z0-9=&_.-]{0,300}))?')
+_FLAG = ('0', '1', 'true', 'false')
+DOCKER_QUERY = {
+    '_ping': {}, 'version': {}, 'inspect': {},
+    'containers/json': {'all': _FLAG.__contains__},
+    # A streaming stats or follow-logs request would hold a proxy thread for as long as the client likes.
+    'stats': {'stream': ('0', 'false').__contains__, 'one-shot': _FLAG.__contains__},
+    'logs': {'stdout': _FLAG.__contains__, 'stderr': _FLAG.__contains__, 'timestamps': _FLAG.__contains__,
+             'tail': lambda v: v.isdigit() and int(v) <= 1000},
+}
+DOCKER_PROXY_SLOTS = 8
+DOCKER_REPLY_LIMIT = 4 * 1024 * 1024
 APP_ID = re.compile(r'[a-z0-9-]{1,40}')
 REMOTE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,39}')
 BRANCH = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
@@ -923,10 +935,71 @@ def serve(runner, path, group=None):
     return server
 
 
+def docker_read(target):
+    """(rebuilt target, kind) for an allow-listed read, else None. Unknown, repeated or streaming
+    query parameters are refused; stats is always pinned to a single sample."""
+    match = DOCKER_READ.fullmatch(target)
+    if not match:
+        return None
+    version, endpoint, cid, action, query = match.groups()
+    kind = {'json': 'inspect'}.get(action, action) or endpoint
+    params = {}
+    for pair in query.split('&') if query else []:
+        key, sep, value = pair.partition('=')
+        check = DOCKER_QUERY[kind].get(key)
+        if not sep or key in params or not check or not check(value):
+            return None
+        params[key] = value
+    if kind == 'stats':
+        params['stream'] = 'false'
+    rebuilt = '/' + (version or '') + endpoint
+    return (rebuilt + '?' + '&'.join(k + '=' + v for k, v in params.items()) if params else rebuilt), kind
+
+
+def inspect_summary(obj):
+    """Container inspect cut down to what SIGNAL shows. Config (Env with its secrets, command lines,
+    labels) and health check output never leave the proxy."""
+    state, host = obj.get('State') or {}, obj.get('HostConfig') or {}
+    summary = {key: state.get(key) for key in ('Status', 'Running', 'Paused', 'Restarting', 'OOMKilled', 'Dead', 'ExitCode', 'StartedAt', 'FinishedAt')}
+    if isinstance(state.get('Health'), dict):
+        summary['Health'] = {'Status': state['Health'].get('Status')}
+    return {'Id': obj.get('Id'), 'Name': obj.get('Name'), 'State': summary, 'RestartCount': obj.get('RestartCount'),
+            'HostConfig': {'RestartPolicy': host.get('RestartPolicy')},
+            'NetworkSettings': {'Networks': {name: {} for name in (obj.get('NetworkSettings') or {}).get('Networks') or {}}},
+            'Mounts': [{'Destination': m.get('Destination'), 'Type': m.get('Type'), 'RW': m.get('RW')} for m in obj.get('Mounts') or []]}
+
+
+class DockerConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path):
+        super().__init__('docker', timeout=30)
+        self.socket_path = socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
 class DockerProxyHandler(socketserver.BaseRequestHandler):
     """Read-only Docker socket for SIGNAL's web server. Only GET requests to the allow-listed reads pass;
-    the request is rebuilt from the validated target, so no client header or body ever reaches Docker."""
+    the request is rebuilt from the validated target, so no client header or body ever reaches Docker,
+    and the reply is rebuilt too, so only status, content type and (filtered) body come back."""
     def handle(self):
+        # A fixed number of slots, taken before reading, so slow or idle clients cannot pile up threads.
+        if not self.server.slots.acquire(blocking=False):
+            try:
+                # Take what the client already sent, so closing answers with the 503 rather than a reset.
+                self.request.settimeout(1)
+                self.request.recv(16384)
+            except OSError:
+                pass
+            return self.reply(503, b'{"message":"The SIGNAL read-only Docker proxy is busy."}')
+        try:
+            self.forward()
+        finally:
+            self.server.slots.release()
+
+    def forward(self):
         self.request.settimeout(10)
         data = b''
         try:
@@ -943,33 +1016,48 @@ class DockerProxyHandler(socketserver.BaseRequestHandler):
         lines = head.decode('latin-1').split('\r\n')
         parts = lines[0].split(' ')
         headers = {line.partition(':')[0].strip().lower() for line in lines[1:]}
-        if (len(parts) != 3 or parts[0] != 'GET' or not parts[2].startswith('HTTP/1.') or rest
-                or headers & {'content-length', 'transfer-encoding', 'upgrade'} or not DOCKER_READ.fullmatch(parts[1])):
+        read = docker_read(parts[1]) if len(parts) == 3 else None
+        if (read is None or parts[0] != 'GET' or not parts[2].startswith('HTTP/1.') or rest
+                or headers & {'content-length', 'transfer-encoding', 'upgrade'}):
             return self.deny()
+        target, kind = read
+        conn = DockerConnection(self.server.docker_socket)
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
-                upstream.settimeout(30)
-                upstream.connect(self.server.docker_socket)
-                upstream.sendall(f'GET {parts[1]} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n'.encode())
-                while True:
-                    chunk = upstream.recv(65536)
-                    if not chunk:
-                        break
-                    self.request.sendall(chunk)
-        except OSError:
-            return
+            conn.request('GET', target)
+            response = conn.getresponse()
+            body = response.read(DOCKER_REPLY_LIMIT + 1)
+            content_type = response.getheader('Content-Type') or 'application/json'
+        except (OSError, http.client.HTTPException):
+            return self.reply(502, b'{"message":"Docker did not answer the SIGNAL proxy."}')
+        finally:
+            conn.close()
+        if len(body) > DOCKER_REPLY_LIMIT:
+            return self.reply(502, b'{"message":"Docker reply too large for the SIGNAL proxy."}')
+        if kind == 'inspect' and response.status == 200:
+            try:
+                body, content_type = json.dumps(inspect_summary(json.loads(body))).encode(), 'application/json'
+            except (ValueError, AttributeError):
+                return self.reply(502, b'{"message":"Unexpected inspect reply from Docker."}')
+        if not re.fullmatch(r'[\w.+/-]+(; ?charset=[\w-]+)?', content_type):
+            content_type = 'application/octet-stream'
+        self.reply(response.status, body, content_type)
 
     def deny(self):
-        body = b'{"message":"Refused by the SIGNAL read-only Docker proxy."}'
+        self.reply(403, b'{"message":"Refused by the SIGNAL read-only Docker proxy."}')
+
+    def reply(self, status, body, content_type='application/json'):
+        head = f'HTTP/1.1 {status} {http.client.responses.get(status, "Status")}\r\nContent-Type: {content_type}\r\n'
+        head += f'Content-Length: {len(body)}\r\nConnection: close\r\n\r\n'
         try:
-            self.request.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(body) + body)
+            self.request.sendall(head.encode() + body)
         except OSError:
             pass
 
 
-def serve_docker_proxy(path, docker_socket=DOCKER_SOCKET, group=None):
+def serve_docker_proxy(path, docker_socket=DOCKER_SOCKET, group=None, slots=DOCKER_PROXY_SLOTS):
     server = bind(path, DockerProxyHandler, group)
     server.docker_socket = docker_socket
+    server.slots = threading.BoundedSemaphore(slots)
     return server
 
 
