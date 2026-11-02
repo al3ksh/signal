@@ -25,6 +25,15 @@ Native-only/path settings (fixed to container mount paths in the supplied Compos
 
 The first usable CPU thermal-zone readings supply temperature (the highest plausible zone value is used). Hardware throttling uses `vcgencmd` if installed in a native Raspberry Pi environment. The supplied container has no `vcgencmd`; absence is displayed honestly.
 
+## App control (optional)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SIGNAL_CONTROL_SOCKET` | Unset (off) | Unix socket of the SIGNAL runner. When set and reachable, the Apps view and control routes appear. |
+| `SIGNAL_CONTROL_ALLOW` | `100.64.0.0/10,127.0.0.1/32,::1/128,fd7a:115c:a1e0::/48` | Socket peers allowed to start, stop, update or roll back apps. Requests through Cloudflare are always read-only. |
+
+App control is designed for the native install. See [APP-CONTROL.md](APP-CONTROL.md) for the runner, registry and security model.
+
 ## Services and HTTP checks
 
 SIGNAL groups containers by the Docker Compose project label. Standalone containers appear together under `standalone`. Open **Services** to inspect a group, pause its alerts during maintenance, or add an HTTP/HTTPS endpoint check. Checks run from the monitored server every 15 seconds with a three-second timeout. They follow redirects, record status and latency, and open an incident after 30 seconds of sustained failure.
@@ -58,7 +67,7 @@ ingress:
 
 Use your tunnel's DNS route and credentials. Do not copy someone else's tunnel ID or credential file. SIGNAL does not create DNS records, install cloudflared, or change your other routes.
 
-Caddy example:
+Caddy example (if Caddy carries public traffic on this host and app control is enabled, remove the loopback ranges from `SIGNAL_CONTROL_ALLOW`):
 
 ```caddyfile
 status.example.com {

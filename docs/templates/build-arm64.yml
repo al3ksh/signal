@@ -1,0 +1,62 @@
+# Copy to .github/workflows/build-arm64.yml in an app repository (not in SIGNAL itself).
+#
+# Builds the app image natively on a GitHub-hosted arm64 runner, so the Raspberry Pi
+# only pulls finished layers instead of running npm ci / pip install on its SD card.
+# Pushes ghcr.io/<owner>/<repo>:<commit sha> and :main.
+#
+# In the app's compose file reference the image by commit, falling back to main:
+#   services:
+#     web:
+#       image: ghcr.io/al3ksh/<app>:${SIGNAL_COMMIT:-main}
+# and set "update": {"mode": "pull"} for the app in /etc/signal/apps.json.
+# The SIGNAL runner sets SIGNAL_COMMIT to the deployed commit, so an update pulls exactly
+# the image built for that commit and a rollback returns to the previous commit's image.
+#
+# Several images in one repository: duplicate the build step with its own context, file
+# and image name (for example ghcr.io/al3ksh/<app>-api).
+name: Build arm64 image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        id: image
+        # ghcr.io names must be lowercase (al3ksh/PortfolioOS -> al3ksh/portfolioos).
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

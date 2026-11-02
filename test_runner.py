@@ -27,6 +27,8 @@ with open(os.path.join(here, 'calls.log'), 'a') as log:
     log.write(json.dumps({'end': sub, 'time': time.time()}) + '\n')
 if sub == 'ps':
     print(config.get('ps', '{"Service":"web","State":"running","Health":"","ExitCode":0}'))
+elif sub == 'config' and '--format' in args:
+    print(config.get('configJson', '{"services": {}}'))
 elif sub == 'config':
     print(config.get('images', 'demo-web'))
 elif sub in config.get('output', {}):
@@ -361,7 +363,7 @@ class UpdateTests(RunnerCase):
         self.assertEqual(job['status'], 'succeeded', item.read_log(job['id'], 0)['data'])
         self.assertEqual((job['prevCommit'], job['newCommit'], job['phase']), (prev, new, 'done'))
         self.assertEqual(fixture.head(), new)
-        self.assertEqual(self.subs(fixture), ['config', 'image', 'build', 'up', 'ps'])
+        self.assertEqual(self.subs(fixture), ['config', 'image', 'config', 'build', 'up', 'ps'])
         build = next(c for c in fixture.calls() if c.get('sub') == 'build')
         self.assertEqual(build['argv'][-2:], ['build', '--pull'])
         self.assertEqual(build['env']['SIGNAL_COMMIT'], new)
@@ -425,7 +427,7 @@ class UpdateTests(RunnerCase):
         self.assertIn(prev[:7], job['message'])
         self.assertEqual(job['phase'], 'rolled back')
         # previous images are re-tagged, so the rollback does not rebuild on the Pi
-        self.assertEqual(self.subs(fixture), ['config', 'image', 'build', 'image', 'up', 'ps'])
+        self.assertEqual(self.subs(fixture), ['config', 'image', 'config', 'build', 'image', 'up', 'ps'])
         retag = [c['argv'] for c in fixture.calls() if c.get('sub') == 'image']
         self.assertEqual(retag, [['image', 'tag', 'demo-web', 'demo-web:signal-prev'], ['image', 'tag', 'demo-web:signal-prev', 'demo-web']])
         up = [c for c in fixture.calls() if c.get('sub') == 'up'][-1]
@@ -548,6 +550,109 @@ class UpdateTests(RunnerCase):
         ends = [c['time'] for c in calls if c.get('end') == 'build']
         self.assertEqual(len(builds), 2)
         self.assertGreaterEqual(builds[1]['start'], ends[0])
+
+
+class SpeedTests(RunnerCase):
+    def make(self, *fixtures):
+        item = self.make_runner(*fixtures)
+        item.health_poll = 0.05
+        return item
+
+    def subs(self, fixture):
+        return [c['sub'] for c in fixture.calls() if 'sub' in c]
+
+    def test_pull_mode_pulls_ci_images_for_the_new_commit(self):
+        fixture = Fixture(self.root, mode='pull')
+        fixture.configure(images='ghcr.io/al3ksh/demo:abc')
+        item = self.make(fixture)
+        new = fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded', item.read_log(job['id'], 0)['data'])
+        self.assertEqual(self.subs(fixture), ['config', 'image', 'pull', 'up', 'ps'])
+        pull = next(c for c in fixture.calls() if c.get('sub') == 'pull')
+        self.assertEqual(pull['env']['SIGNAL_COMMIT'], new)
+        self.assertEqual(next(c for c in fixture.calls() if c.get('sub') == 'image')['argv'], ['image', 'tag', 'ghcr.io/al3ksh/demo:abc', 'ghcr.io/al3ksh/demo:signal-prev'])
+
+    def test_pull_failure_restores_previous_images_without_building(self):
+        fixture = Fixture(self.root, mode='pull')
+        fixture.configure(fail={'pull': 1})
+        item = self.make(fixture)
+        prev = fixture.head()
+        fixture.push('second')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'rolled_back')
+        self.assertEqual(fixture.head(), prev)
+        self.assertNotIn('build', self.subs(fixture))
+        self.assertEqual(self.subs(fixture)[-3:], ['image', 'up', 'ps'])
+
+    def two_service_fixture(self):
+        fixture = Fixture(self.root)
+        config = {'services': {
+            'web': {'build': {'context': str((fixture.dir / 'web').resolve()), 'dockerfile': 'Dockerfile'}},
+            'api': {'build': {'context': str((fixture.dir / 'api').resolve()), 'dockerfile': str((fixture.dir / 'docker' / 'api.Dockerfile').resolve())}},
+            'db': {'image': 'postgres:16'}}}
+        fixture.configure(configJson=json.dumps(config))
+        return fixture
+
+    def build_args(self, fixture):
+        return [c['argv'][c['argv'].index('build'):] for c in fixture.calls() if c.get('sub') == 'build']
+
+    def test_build_only_services_whose_context_changed(self):
+        fixture = self.two_service_fixture()
+        item = self.make(fixture)
+        fixture.push('web change', 'web/index.html')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual(self.build_args(fixture), [['build', '--pull', 'web']])
+
+    def test_dockerfile_outside_context_counts(self):
+        fixture = self.two_service_fixture()
+        item = self.make(fixture)
+        fixture.push('api dockerfile', 'docker/api.Dockerfile')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual(self.build_args(fixture), [['build', '--pull', 'api']])
+
+    def test_unrelated_change_skips_the_build(self):
+        fixture = self.two_service_fixture()
+        item = self.make(fixture)
+        fixture.push('docs', 'README.md')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded')
+        self.assertEqual(self.build_args(fixture), [])
+        self.assertIn('skipping the build', item.read_log(job['id'], 0)['data'])
+        self.assertIn('up', self.subs(fixture))
+
+    def test_compose_file_change_builds_everything(self):
+        fixture = self.two_service_fixture()
+        item = self.make(fixture)
+        fixture.push('compose', 'compose.yml', 'services: {web: {build: ./web}}\n')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual(self.build_args(fixture), [['build', '--pull']])
+
+    def test_unreadable_config_builds_everything(self):
+        fixture = Fixture(self.root)
+        fixture.configure(configJson='not json')
+        item = self.make(fixture)
+        fixture.push('web change')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual(self.build_args(fixture), [['build', '--pull']])
+
+    def test_rendered_config_is_not_logged(self):
+        fixture = Fixture(self.root)
+        config = {'services': {'web': {'build': {'context': str((fixture.dir / 'web').resolve())}, 'environment': {'TOKEN': 'hunter2-secret'}}}}
+        fixture.configure(configJson=json.dumps(config))
+        item = self.make(fixture)
+        fixture.push('web change')
+        job = wait(item, item.submit('demo', 'update', 't')['id'])
+        self.assertEqual(job['status'], 'succeeded')
+        self.assertNotIn('hunter2-secret', item.read_log(job['id'], 0)['data'])
+
+    def test_option_like_service_names_are_never_passed(self):
+        fixture = Fixture(self.root)
+        fixture.configure(configJson=json.dumps({'services': {'--privileged': {'build': {'context': str((fixture.dir / 'web').resolve())}}}}))
+        item = self.make(fixture)
+        fixture.push('web change')
+        self.assertEqual(wait(item, item.submit('demo', 'update', 't')['id'])['status'], 'succeeded')
+        self.assertEqual(self.build_args(fixture), [['build', '--pull']])
 
 
 class SocketTests(RunnerCase):

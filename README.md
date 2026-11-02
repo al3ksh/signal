@@ -55,6 +55,7 @@ sh ./signal update   # Rebuild from the source currently on disk
 - [Configuration and reverse proxies](docs/CONFIGURATION.md)
 - [History and alert behavior](docs/ALERTS-AND-HISTORY.md)
 - [Architecture and API](docs/ARCHITECTURE.md)
+- [App control: start, stop, update and roll back Compose apps (optional)](docs/APP-CONTROL.md)
 - [Security and deployment boundaries](SECURITY.md)
 - [Development and contribution checks](CONTRIBUTING.md)
 - [Changes](CHANGELOG.md)

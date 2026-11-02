@@ -18,5 +18,6 @@ jobs:
       - run: npm run build
       - run: python -m unittest discover -v
       - run: sh -n signal
+      - run: sh -n deploy/update-signal.sh
       - run: DOCKER_GID=999 docker compose config --quiet
       - run: docker build -t signal:ci .
