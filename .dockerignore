@@ -13,3 +13,5 @@
 !storage.py
 !alerts.py
 !setup_access.py
+!health.py
+!setup_2fa.py
