@@ -566,6 +566,72 @@ class UpdateTests(RunnerCase):
         self.assertGreaterEqual(builds[1]['start'], ends[0])
 
 
+class RecoveryTests(RunnerCase):
+    def interrupted(self, fixture, phase, move=True):
+        """Leave the state a runner killed mid-deploy would leave: a running job and a moved checkout."""
+        item = self.make_runner(fixture)
+        prev = fixture.head()
+        new = fixture.push('second')
+        if move:
+            git(fixture.dir, 'fetch', '-q', 'origin')
+            git(fixture.dir, 'merge', '-q', '--ff-only', 'origin/main')
+        job = {'id': 'a' * 32, 'app': 'demo', 'action': 'update', 'actor': 't', 'created': time.time()}
+        item.store.create(job)
+        item.store.update(job['id'], status='running', phase=phase, started=time.time(), prev_commit=prev,
+                          new_commit=new if move else None, images=json.dumps([['demo-web', 'demo-web:signal-prev']]))
+        item.close()
+        self.runners.remove(item)
+        return prev, new, job['id']
+
+    def recovery_jobs(self, item):
+        return [j for j in item.store.jobs('demo', 10) if j['action'] == 'recover']
+
+    def test_interrupted_deploy_is_rolled_back_on_start(self):
+        fixture = Fixture(self.root)
+        prev, new, old_id = self.interrupted(fixture, 'health')
+        self.assertEqual(fixture.head(), new)
+        item = self.make_runner(fixture)
+        item.health_poll = 0.05
+        jobs = self.recovery_jobs(item)
+        self.assertEqual(len(jobs), 1)
+        job = wait(item, jobs[0]['id'])
+        self.assertEqual(job['status'], 'rolled_back', item.read_log(job['id'], 0)['data'])
+        self.assertEqual(job['actor'], 'runner (recovery)')
+        self.assertEqual(fixture.head(), prev)
+        self.assertEqual((job['prevCommit'], job['newCommit']), (new, prev))
+        old = item.store.job(old_id)
+        self.assertEqual(old['status'], 'failed')
+        self.assertIn(job['id'][:12], old['message'])
+        calls = fixture.calls()
+        self.assertIn(['image', 'tag', 'demo-web:signal-prev', 'demo-web'], [c['argv'] for c in calls if c.get('sub') == 'image'])
+        self.assertEqual([c for c in calls if c.get('sub') == 'up'][-1]['env']['SIGNAL_COMMIT'], prev)
+
+    def test_interrupted_before_the_checkout_moved_needs_nothing(self):
+        fixture = Fixture(self.root)
+        prev, _, old_id = self.interrupted(fixture, 'fetch', move=False)
+        item = self.make_runner(fixture)
+        self.assertEqual(self.recovery_jobs(item), [])
+        self.assertEqual(item.store.job(old_id)['status'], 'failed')
+        self.assertEqual(fixture.head(), prev)
+
+    def test_checkout_changed_by_hand_is_left_alone(self):
+        fixture = Fixture(self.root)
+        _, new, _ = self.interrupted(fixture, 'build')
+        (fixture.dir / 'hand.txt').write_text('x\n')
+        git(fixture.dir, 'add', 'hand.txt')
+        git(fixture.dir, 'commit', '-q', '-m', 'hand fix on the host')
+        manual = fixture.head()
+        item = self.make_runner(fixture)
+        self.assertEqual(self.recovery_jobs(item), [])
+        self.assertEqual(fixture.head(), manual)
+
+    def test_recover_is_not_a_requestable_action(self):
+        fixture = Fixture(self.root)
+        item = self.make_runner(fixture)
+        with self.assertRaises(runner.RequestError):
+            item.handle({'op': 'run', 'app': 'demo', 'action': 'recover'})
+
+
 class SpeedTests(RunnerCase):
     def make(self, *fixtures):
         item = self.make_runner(*fixtures)
