@@ -703,7 +703,8 @@ class Handler(BaseHTTPRequestHandler):
                  'detail': detail, 'actor': self.client_key()}
         print('Control:', outcome, action, name, 'from', event['actor'], '-', detail, flush=True)
         monitor = getattr(self.server, 'monitor', None)
-        if monitor is not None and hasattr(monitor, 'events'):
+        # Only signed-in requests reach the bounded journal; anonymous noise stays in the service log.
+        if monitor is not None and hasattr(monitor, 'events') and AUTH and self.authenticated():
             with monitor.lock:
                 monitor.events.appendleft(event)
 

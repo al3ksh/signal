@@ -36,7 +36,7 @@ A mutation needs **all** of:
 4. A same-origin JSON request (`Origin` equal to `Host`, or `Sec-Fetch-Site: same-origin`, and `Content-Type: application/json`).
 5. A password step-up: the first action asks for the access password again and sets a 10-minute, HttpOnly, SameSite=Strict grant bound to the session. `check` (a `git fetch`) does not need the step-up.
 
-Requests are rate-limited (20 control requests and 5 failed step-ups per minute per client). Every control request, accepted or refused, is written to the Signal journal (kind `control`) and to the service log.
+Requests are rate-limited (20 control requests and 5 failed step-ups per minute per client). Every control request, accepted or refused, is written to the service log (`journalctl -u signal`); those from signed-in sessions also appear in the Signal journal (kind `control`). Anonymous refusals stay out of the journal so they cannot push real events out of it.
 
 If you add another reverse proxy on the Pi that carries public traffic to `127.0.0.1:8091` (Caddy, nginx), remove the loopback ranges from `SIGNAL_CONTROL_ALLOW`, otherwise public requests through it would look local.
 
