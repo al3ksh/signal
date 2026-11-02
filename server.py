@@ -794,9 +794,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(403, {'error': 'Job logs require a private session.'})
                 try:
                     offset = max(0, int(query.get('offset', ['0'])[0]))
+                    request = {'op': 'log', 'id': match[1], 'offset': offset}
+                    if 'epoch' in query:
+                        request['epoch'] = int(query['epoch'][0])
                 except ValueError:
                     return self.json(400, {'error': 'Invalid offset.'})
-                return self.json(200, control_call({'op': 'log', 'id': match[1], 'offset': offset}))
+                return self.json(200, control_call(request))
             if match:
                 return self.json(200, control_call({'op': 'job', 'id': match[1]}))
             return self.json(404, {'error': 'Unknown endpoint.'})

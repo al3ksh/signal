@@ -16,7 +16,7 @@ browser ──HTTPS──> server.py (unprivileged, Docker GET only, as before)
                      │  /etc/signal/apps.json  (registry, validated at start, refuses to run if invalid)
                      │  git … / docker compose -p <id> -f … as argv lists, cwd = app dir, minimal env
                      ▼
-                  /var/lib/signal-runner/  jobs.db · logs/<job>.log (2 MiB cap, last 200 jobs)
+                  /var/lib/signal-runner/  jobs.db · logs/<job>.log (2 MiB cap keeping the beginning and the latest output, last 200 jobs)
 ```
 
 - The browser and API only ever send `{app, action}`. Apps come from the registry; actions are the fixed set `start`, `stop`, `restart`, `check`, `update`, `rollback`. No request field becomes part of a command line, and nothing runs through a shell.

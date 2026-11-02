@@ -307,18 +307,32 @@ class LifecycleTests(RunnerCase):
         self.assertEqual(job['status'], 'failed')
         self.assertIn('timed out', job['message'])
 
-    def test_log_is_capped_and_paged(self):
+    def test_log_keeps_head_and_tail_and_is_paged(self):
         fixture = Fixture(self.root, repo=False)
-        fixture.configure(output={'restart': 'x' * 5000})
+        fixture.configure(output={'restart': '\n'.join(f'line {i:04d} ' + 'x' * 40 for i in range(200))})
         item = self.make_runner(fixture)
-        item.log_cap = 1000
+        item.log_cap = 2000
         job = wait(item, item.submit('demo', 'restart', 't')['id'])
         size = (item.data_dir / 'logs' / (job['id'] + '.log')).stat().st_size
-        self.assertLess(size, 1200)
+        self.assertLessEqual(size, 2000)
+        log = item.read_log(job['id'], 0)['data']
+        self.assertTrue(log.startswith('# restart demo by t'))
+        self.assertIn('bytes of output omitted', log)
+        self.assertIn('line 0199', log)  # the end of the output, where errors are, survives
+        self.assertIn('# succeeded', log)
+        self.assertNotIn('line 0100', log)
         first = item.read_log(job['id'], 0, limit=100)
         self.assertEqual(first['offset'], 100)
-        rest = item.read_log(job['id'], first['offset'])
-        self.assertIn('log truncated', rest['data'])
+        self.assertEqual(item.read_log(job['id'], first['offset'], epoch=first['epoch'])['data'], log[100:])
+
+    def test_log_reader_resets_after_compaction(self):
+        fixture = Fixture(self.root, repo=False)
+        item = self.make_runner(fixture)
+        job = wait(item, item.submit('demo', 'restart', 't')['id'])
+        stale = item.read_log(job['id'], 40, epoch=3)
+        self.assertTrue(stale['reset'])
+        self.assertTrue(stale['data'].startswith('# restart'))
+        self.assertFalse(item.read_log(job['id'], 40, epoch=stale['epoch'])['reset'])
 
     def test_history_is_pruned_and_interrupted_jobs_recovered(self):
         fixture = Fixture(self.root, repo=False)

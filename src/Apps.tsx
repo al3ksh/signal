@@ -83,17 +83,17 @@ const terminal=(job:Job)=>!['queued','running'].includes(job.status);
 const statusIcon=(status:string)=>status==='succeeded'?<CheckCircle size={14}/>:status==='rolled_back'||status==='cancelled'?<ArrowCounterClockwise size={14}/>:status==='failed'?<XCircle size={14}/>:<i className="dot"/>;
 
 export function JobDrawer({job:initial,app,canControl,motion,onClose,onChanged}:{job:Job;app:ManagedApp|null;canControl:boolean;motion:boolean;onClose:()=>void;onChanged:()=>void}){
-  const ref=useRef<HTMLDialogElement>(null),logRef=useRef<HTMLPreElement>(null),offset=useRef(0);
+  const ref=useRef<HTMLDialogElement>(null),logRef=useRef<HTMLPreElement>(null),offset=useRef(0),epoch=useRef<number|null>(null);
   const [job,setJob]=useState<Job>(initial),[log,setLog]=useState(''),[history,setHistory]=useState<Job[]>([]),[follow,setFollow]=useState(true),[wrap,setWrap]=useState(true),[query,setQuery]=useState(''),[error,setError]=useState(''),[copied,setCopied]=useState(false),[password,setPassword]=useState(''),[needPassword,setNeedPassword]=useState(false),[busy,setBusy]=useState(false);
   useEffect(()=>{ref.current?.showModal();},[]);
   useEffect(()=>{setJob(initial);},[initial]);
-  useEffect(()=>{offset.current=0;setLog('');setError('');},[job.id]);
+  useEffect(()=>{offset.current=0;epoch.current=null;setLog('');setError('');},[job.id]);
   useEffect(()=>{let stop=false,timer=0;
     async function tick(){try{
-      const [jr,lr]=await Promise.all([fetch(`/api/jobs/${job.id}`),fetch(`/api/jobs/${job.id}/log?offset=${offset.current}`)]);
+      const [jr,lr]=await Promise.all([fetch(`/api/jobs/${job.id}`),fetch(`/api/jobs/${job.id}/log?offset=${offset.current}${epoch.current===null?'':`&epoch=${epoch.current}`}`)]);
       const jd=await jr.json(),ld=await lr.json();if(stop)return;
       if(!jr.ok)throw new Error(jd.error||'Could not read this job.');if(!lr.ok)throw new Error(ld.error||'Could not read the job log.');
-      setJob(jd.job);if(ld.data){offset.current=ld.offset;setLog(value=>(value+ld.data).slice(-400000));}
+      setJob(jd.job);epoch.current=ld.epoch;if(ld.reset){offset.current=ld.offset;setLog(ld.data);}else if(ld.data){offset.current=ld.offset;setLog(value=>(value+ld.data).slice(-400000));}
       if(ld.data&&ld.data.length>=65536){timer=window.setTimeout(tick,50);return;}
       if(terminal(jd.job)){onChanged();return;}
       setError('');

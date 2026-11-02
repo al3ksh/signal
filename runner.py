@@ -322,7 +322,8 @@ class Runner:
             if len(self.active) >= 20:
                 raise RequestError('Too many queued jobs.', 'conflict')
             handle = {'id': uuid.uuid4().hex, 'app': app_id, 'action': action, 'actor': actor, 'created': time.time(),
-                      'cancelled': threading.Event(), 'proc': None, 'timed_out': False, 'log': None, 'size': 0}
+                      'cancelled': threading.Event(), 'proc': None, 'timed_out': False, 'log': None, 'size': 0,
+                      'head': b'', 'total': 0, 'epoch': 0}
             self.store.create(handle)
             self.active[handle['id']] = handle
         threading.Thread(target=self.execute, args=(handle,), daemon=True, name='job-' + handle['id'][:8]).start()
@@ -332,7 +333,7 @@ class Runner:
         app = self.apps[handle['app']]
         status, message, exit_code = 'failed', None, None
         try:
-            with self.app_locks[app['id']], open(self.logs / (handle['id'] + '.log'), 'w', encoding='utf-8') as log:
+            with self.app_locks[app['id']], open(self.logs / (handle['id'] + '.log'), 'w+b') as log:
                 handle['log'] = log
                 if handle['cancelled'].is_set():
                     raise JobCancelled()
@@ -366,17 +367,38 @@ class Runner:
                     self.active.pop(handle['id'], None)
 
     def write(self, handle, text):
+        """Append to the job log. Past log_cap the file keeps the first quarter and the most recent half,
+        because the end of a failed build is what explains it."""
         log = handle['log']
-        if log is None or handle['size'] > self.log_cap:
+        if log is None:
             return
         data = text.encode('utf-8', 'replace')
-        if handle['size'] + len(data) > self.log_cap:
-            data = data[:max(0, self.log_cap - handle['size'])] + b'\n[log truncated at %d bytes]\n' % self.log_cap
-            handle['size'] = self.log_cap + 1
-        else:
-            handle['size'] += len(data)
-        log.write(data.decode('utf-8', 'replace'))
+        handle['total'] += len(data)
+        room = self.log_cap // 4 - len(handle['head'])
+        if room > 0:
+            handle['head'] += data[:room]
+        log.write(data)
+        handle['size'] += len(data)
+        if handle['size'] > self.log_cap:
+            self.compact(handle)
         log.flush()
+
+    def compact(self, handle):
+        log = handle['log']
+        log.flush()
+        log.seek(0)
+        tail = log.read()[-(self.log_cap // 2):]
+        newline = tail.find(b'\n')
+        tail = tail[newline + 1:] if 0 <= newline < 4096 else tail
+        head = handle['head']
+        head = head[:head.rfind(b'\n') + 1] or head
+        marker = b'\n[... %d bytes of output omitted; the log keeps the beginning and the most recent output ...]\n\n' % max(0, handle['total'] - len(head) - len(tail))
+        content = head + marker + tail
+        log.seek(0)
+        log.truncate()
+        log.write(content)
+        handle['size'] = len(content)
+        handle['epoch'] += 1
 
     def kill(self, handle, proc, reason):
         if reason == 'timeout':
@@ -697,19 +719,27 @@ class Runner:
             threading.Thread(target=self.kill, args=(handle, proc, 'cancel'), daemon=True).start()
         return self.store.job(job_id)
 
-    def read_log(self, job_id, offset, limit=64 * 1024):
+    def read_log(self, job_id, offset, limit=64 * 1024, epoch=None):
+        """Incremental read. epoch changes whenever a live log is compacted (and is -1 once the job is over);
+        a reader holding another epoch starts again from 0 and replaces what it shows."""
         row = self.store.row(job_id)
         if row is None:
             raise RequestError('Unknown job.', 'not_found')
+        with self.active_lock:
+            handle = self.active.get(job_id)
+            current = handle['epoch'] if handle else -1
+        offset = max(0, offset)
+        reset = epoch is not None and epoch != current and offset > 0
+        if reset:
+            offset = 0
         path = self.logs / (job_id + '.log')
         data = b''
         if path.exists():
             with open(path, 'rb') as file:
-                file.seek(max(0, offset))
+                file.seek(offset)
                 data = file.read(limit)
-        with self.active_lock:
-            running = job_id in self.active
-        return {'data': data.decode('utf-8', 'replace'), 'offset': max(0, offset) + len(data), 'done': not running, 'status': row['status']}
+        return {'data': data.decode('utf-8', 'replace'), 'offset': offset + len(data), 'done': handle is None,
+                'status': row['status'], 'epoch': current, 'reset': reset}
 
     # -- protocol ----------------------------------------------------------
     def summary(self, app_id):
@@ -758,8 +788,9 @@ class Runner:
                 raise RequestError('Unknown job.', 'not_found')
             return {'job': job}
         if op == 'log':
-            offset = request.get('offset', 0)
-            return self.read_log(self.job_id(request), offset if isinstance(offset, int) and offset >= 0 else 0)
+            offset, epoch = request.get('offset', 0), request.get('epoch')
+            return self.read_log(self.job_id(request), offset if isinstance(offset, int) and offset >= 0 else 0,
+                                 epoch=epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None)
         if op == 'cancel':
             return {'job': self.cancel(self.job_id(request))}
         raise RequestError('Unknown operation.')
