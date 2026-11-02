@@ -7,6 +7,12 @@
 - Added one-click update from the repository (fast-forward only, refused on a dirty or diverged checkout) with live job logs, a phase indicator, container and HTTP health checks and automatic rollback to the exact previous commit, reusing the previous images when they were saved. Added manual rollback, job history, job cancellation and command-palette entries for updating, restarting and opening job logs.
 - Faster updates: `pull` mode deploys CI-built images pinned to the deployed commit (`SIGNAL_COMMIT`), build mode rebuilds only services whose build context changed, a reusable arm64 GitHub Actions template (`docs/templates/build-arm64.yml`), and `deploy/update-signal.sh` for updating SIGNAL itself. See `docs/APP-CONTROL.md`.
 - Added a Fluent-style motion layer: pointer-tracked reveal light and edge glow, a sliding navigation indicator, acrylic dialogs, staggered card entrances, pressed states, a job progress rail with phase shimmer, and a decorative ambient signal field behind the interface. All of it respects reduced motion, the quiet motion setting, paused observation and hidden tabs.
+- Deploys cut off by a runner restart are rolled back automatically on the next start, while the checkout is still where the interrupted job left it.
+- Pull-mode updates wait for CI: they stop with a clear message until the images pinned to the new commit are published.
+- Long job logs keep their beginning and the latest output instead of being cut at 2 MiB.
+- Failed app jobs open a critical incident and rolled-back ones a warning in Alerts & events.
+- Optional read-only Docker socket served by the runner, so SIGNAL's web server can run as its own user without Docker access.
+- Fonts are emitted as files, fixing a Content-Security-Policy console error.
 
 ## 2.2.0 — 2026-09-18
 
