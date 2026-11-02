@@ -1,13 +1,31 @@
 """Debounced local incidents, keyed by container name across recreations."""
 import os
+import re
 import threading
+
+# Docker names unnamed containers "<adjective>_<surname>" from its own word list. Those are one-off `docker run`s,
+# so they are never watched: once gone they would stay "missing" for ever.
+DOCKER_ADJECTIVES = set('''admiring adoring affectionate agitated amazing angry awesome beautiful blissful bold boring brave busy
+charming clever compassionate competent condescending confident cool cranky crazy dazzling determined distracted dreamy
+eager ecstatic elastic elated elegant eloquent epic exciting fervent festive flamboyant focused friendly frosty funny gallant
+gifted goofy gracious great happy hardcore heuristic hopeful hungry infallible inspiring intelligent interesting jolly
+jovial keen kind laughing loving lucid magical modest musing mystifying naughty nervous nice nifty nostalgic objective
+optimistic peaceful pedantic pensive practical priceless quirky quizzical recursing relaxed reverent romantic sad serene
+sharp silly sleepy stoic strange stupefied suspicious sweet tender thirsty trusting unruffled upbeat vibrant vigilant
+vigorous wizardly wonderful xenodochial youthful zealous zen'''.split())
+GENERATED_NAME = re.compile(r'([a-z]+)_[a-z]+[0-9]?')
+
+
+def generated_name(name):
+    match = GENERATED_NAME.fullmatch(name)
+    return bool(match) and match[1] in DOCKER_ADJECTIVES
 
 
 class AlertEngine:
     def __init__(self, store):
         self.store = store
         self.pending = {}
-        self.watched = set(store.metadata('watched', []))
+        self.watched = {name for name in store.metadata('watched', []) if not generated_name(name)}
         self.muted = set(store.metadata('mutedContainers', []))
         self.maintenance = store.metadata('maintenance', {})
         self.active = {a['key'] for a in store.alerts() if a['resolved'] is None}
@@ -176,7 +194,8 @@ class AlertEngine:
                 persistent_ignored = label_ignored | self.muted
                 maintained = {c['name'] for c in data['containers'] if c.get('project', 'standalone') in maintenance}
                 ignored = persistent_ignored | maintained
-                self.watched.update(c['name'] for c in data['containers'] if c['state'] == 'running' and c['name'] not in persistent_ignored)
+                self.watched.update(c['name'] for c in data['containers'] if c['state'] == 'running' and c['name'] not in persistent_ignored
+                                    and not (c.get('project', 'standalone') == 'standalone' and generated_name(c['name'])))
                 self.watched -= persistent_ignored
                 if before != self.watched:
                     self.store.set_metadata('watched', sorted(self.watched))
@@ -185,6 +204,10 @@ class AlertEngine:
                     bad = name not in ignored and (c is None or c['state'] != 'running' or c['health'] == 'unhealthy')
                     state = 'missing' if c is None else ('unhealthy' if c['health'] == 'unhealthy' else c['state'])
                     self.check('container:'+name, bad, name+' needs attention', 'Container state: '+state+'.', now, severity='critical')
+                for key in list(self.active):
+                    name = key[len('container:'):]
+                    if key.startswith('container:') and generated_name(name) and name not in self.watched | ignored:
+                        self.clear_condition(key, now)
             else:
                 for key in list(self.pending):
                     if key.startswith('container:'):

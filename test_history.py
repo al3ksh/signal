@@ -120,6 +120,22 @@ class AlertTests(HistoryTests):
         restarted.evaluate(self.sample(55))
         self.assertIsNotNone(self.store.alerts()[0]['resolved'])
 
+    def test_one_off_docker_run_containers_are_not_watched(self):
+        def sample(offset, *containers):
+            data = self.sample(offset)
+            data['containers'] += [dict(name=name, project=project, state='running', health=None) for name, project in containers]
+            return data
+        # An incident left over from before this rule, for a container that is long gone.
+        self.store.open_alert('container:sad_dubinsky', 'critical', 'sad_dubinsky needs attention', 'Container state: missing.', self.now)
+        self.store.set_metadata('watched', ['web', 'sad_dubinsky'])
+        engine = AlertEngine(self.store)
+        engine.evaluate(sample(0, ('pedantic_galileo', 'standalone'), ('my_app', 'standalone'), ('happy_web', 'stack')))
+        for offset in (5, 30):
+            engine.evaluate(self.sample(offset))
+        open_keys = {a['key'] for a in self.store.alerts() if a['resolved'] is None}
+        self.assertEqual(open_keys, {'container:my_app', 'container:happy_web'})
+        self.assertNotIn('sad_dubinsky', engine.watched)
+
     def test_manual_mute_resolves_and_persists(self):
         engine = AlertEngine(self.store)
         engine.evaluate(self.sample(0))
