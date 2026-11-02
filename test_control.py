@@ -45,6 +45,8 @@ class FakeRunner(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 return {'ok': False, 'code': 'not_found', 'error': 'Unknown app.'}
             return {'ok': True, 'job': {'id': 'f'*32, 'app': request['app'], 'action': request['action'], 'status': 'queued'}}
         if op == 'jobs':
+            if request.get('app') not in {a['id'] for a in self.apps}:
+                return {'ok': False, 'code': 'not_found', 'error': 'Unknown app.'}
             return {'ok': True, 'jobs': [{'id': 'f'*32, 'app': request['app'], 'action': 'restart', 'status': 'succeeded'}]}
         if op == 'job':
             return {'ok': True, 'job': {'id': request['id'], 'status': 'running'}}
@@ -148,6 +150,117 @@ class ControlTests(unittest.TestCase):
         data = json.loads(self.get('/api/apps', **{'CF-Connecting-IP': '203.0.113.9'}).body)
         self.assertFalse(data['control']['allowed'])
         self.assertEqual(len(data['apps']), 2)
+
+    # -- phase 2: lifecycle mutations ------------------------------------------
+    def post(self, path, body=None, password=None, **headers):
+        body = dict(body or {})
+        if password is not None:
+            body['password'] = password
+        base = {'Cookie': self.session, 'Origin': 'http://' + self.host, 'Content-Type': 'application/json'}
+        return self.request(path, 'POST', body, {**base, **headers})
+
+    def runs(self):
+        return [r for r in self.runner.requests if r.get('op') == 'run']
+
+    def control_events(self):
+        return [e for e in self.httpd.monitor.events if e.get('kind') == 'control']
+
+    def test_disabled_control_mutations_are_404(self):
+        with patch.object(server, 'CONTROL_SOCKET', None):
+            self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password').status, 404)
+        self.assertEqual(self.runner.requests, [])
+
+    def test_mutation_requires_session(self):
+        response = self.request('/api/apps/portfolio/restart', 'POST', {'password': 'test-password'}, {'Origin': 'http://' + self.host, 'Content-Type': 'application/json'})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(self.runs(), [])
+
+    def test_tunnel_requests_cannot_mutate(self):
+        response = self.post('/api/apps/portfolio/restart', password='test-password', **{'Cf-Ray': 'abc', 'CF-Connecting-IP': '100.100.1.1'})
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.runs(), [])
+        event = self.control_events()[0]
+        self.assertEqual((event['name'], event['state'], event['outcome']), ('portfolio', 'restart', 'refused'))
+
+    def test_networks_outside_allow_list_cannot_mutate(self):
+        with patch.object(server, 'CONTROL_ALLOW', [server.ipaddress.ip_network('100.64.0.0/10')]):
+            self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password').status, 403)
+            self.assertFalse(json.loads(self.get('/api/session').body)['control']['allowed'])
+        self.assertEqual(self.runs(), [])
+
+    def test_csrf_protection(self):
+        for headers in [{'Origin': 'https://evil.example'}, {'Origin': ''}, {'Origin': '', 'Sec-Fetch-Site': 'cross-site'},
+                        {'Content-Type': 'text/plain'}]:
+            with self.subTest(headers=headers):
+                self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password', **headers).status, 403)
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password', Origin='', **{'Sec-Fetch-Site': 'same-origin'}).status, 202)
+
+    def test_step_up_password_and_grant(self):
+        response = self.post('/api/apps/portfolio/restart')
+        self.assertEqual(response.status, 403)
+        self.assertTrue(json.loads(response.body)['stepUp'])
+        self.assertEqual(self.post('/api/apps/portfolio/restart', password='wrong').status, 403)
+        self.assertEqual(self.runs(), [])
+        response = self.post('/api/apps/portfolio/restart', password='test-password')
+        self.assertEqual(response.status, 202)
+        self.assertEqual(json.loads(response.body)['job']['action'], 'restart')
+        cookie = response.headers['Set-Cookie']
+        for flag in ['signal_control=', 'HttpOnly', 'SameSite=Strict', 'Max-Age=600']:
+            self.assertIn(flag, cookie)
+        grant = cookie.split(';')[0]
+        both = self.session + '; ' + grant
+        self.assertEqual(self.post('/api/apps/portfolio/stop', Cookie=both).status, 202)
+        self.assertTrue(json.loads(self.get('/api/session', Cookie=both).body)['control']['granted'])
+        other_session = 'signal_session=' + server.make_session() + '; ' + grant
+        self.assertEqual(self.post('/api/apps/portfolio/stop', Cookie=other_session).status, 403)
+        expired = 'signal_control=' + server.make_control_grant(self.session.split('=', 1)[1], int(server.time.time()) - 1)
+        self.assertEqual(self.post('/api/apps/portfolio/stop', Cookie=self.session + '; ' + expired).status, 403)
+
+    def test_check_does_not_need_step_up(self):
+        self.assertEqual(self.post('/api/apps/portfolio/check').status, 202)
+
+    def test_wrong_password_is_rate_limited(self):
+        for _ in range(5):
+            self.assertEqual(self.post('/api/apps/portfolio/restart', password='wrong').status, 403)
+        self.assertEqual(self.post('/api/apps/portfolio/restart', password='test-password').status, 429)
+        self.assertEqual(self.runs(), [])
+
+    def test_mutations_are_rate_limited(self):
+        statuses = [self.post('/api/apps/portfolio/check').status for _ in range(server.CONTROL_RATE_LIMIT + 1)]
+        self.assertEqual(statuses[-1], 429)
+        self.assertEqual(set(statuses[:-1]), {202})
+
+    def test_unknown_app_and_action(self):
+        self.assertEqual(self.post('/api/apps/nope/restart', password='test-password').status, 404)
+        self.assertEqual(self.post('/api/apps/portfolio/exec', password='test-password').status, 404)
+        self.assertEqual(self.post('/api/apps/Portfolio/restart', password='test-password').status, 404)
+        self.assertEqual(self.runs(), [])
+
+    def test_only_validated_id_and_action_reach_the_runner(self):
+        body = {'app': '../../etc', 'action': 'exec', 'cmd': 'rm -rf /', 'args': ['--privileged'], 'actor': 'root'}
+        self.assertEqual(self.post('/api/apps/portfolio/restart', body, password='test-password').status, 202)
+        run = self.runs()[0]
+        self.assertEqual(set(run), {'op', 'app', 'action', 'actor'})
+        self.assertEqual((run['app'], run['action']), ('portfolio', 'restart'))
+        self.assertEqual(run['actor'], 'session@127.0.0.1')
+
+    def test_audit_records_accepted_and_refused(self):
+        self.post('/api/apps/portfolio/restart', password='wrong')
+        self.post('/api/apps/portfolio/restart', password='test-password')
+        outcomes = [(e['state'], e['outcome']) for e in self.control_events()]
+        self.assertEqual(outcomes, [('restart', 'accepted'), ('restart', 'refused')])
+        self.assertIn('password', self.control_events()[1]['detail'].lower())
+
+    def test_job_endpoints_forward_to_runner(self):
+        job = 'f' * 32
+        self.assertEqual(json.loads(self.get('/api/apps/portfolio/jobs').body)['jobs'][0]['id'], job)
+        self.assertEqual(json.loads(self.get('/api/jobs/' + job).body)['job']['status'], 'running')
+        log = json.loads(self.get('/api/jobs/' + job + '/log?offset=7').body)
+        self.assertEqual((log['data'], log['offset']), ('line\n', 12))
+        self.assertEqual(self.get('/api/jobs/not-a-job').status, 404)
+        self.assertEqual(self.get('/api/apps/nope/jobs').status, 404)
+        self.assertEqual(self.post('/api/jobs/' + job + '/cancel', password='test-password').status, 200)
 
 
 if __name__ == '__main__':

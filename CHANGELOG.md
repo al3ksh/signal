@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added an optional app registry and a separate runner (`runner.py`) that reports each Compose app's deployed commit and how many commits it is behind its repository branch. A new Apps view appears only when `SIGNAL_CONTROL_SOCKET` is set and the runner is reachable.
+- Added start, stop and restart for registered apps through the runner. Control is refused through the public tunnel, needs a same-origin request and a password step-up (10-minute grant), is rate-limited and is recorded in the journal. Ships a hardened `deploy/signal-runner.service`.
 
 ## 2.2.0 — 2026-09-18
 

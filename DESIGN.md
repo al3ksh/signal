@@ -53,4 +53,8 @@ The sidebar becomes an icon rail at 1250px and a top navigation bar at 640px. Th
 
 ## Boundaries
 
-Do not restore green-tinted hardcoded backgrounds. Do not introduce Docker mutations, command execution, invented uptime or historical values. Preserve private authentication and actual container data. External alert delivery and application-level health probes remain separate capabilities.
+Do not restore green-tinted hardcoded backgrounds. Do not introduce command execution, invented uptime or historical values. Preserve private authentication and actual container data. External alert delivery and application-level health probes remain separate capabilities.
+
+The web server never mutates Docker. The one deliberate exception is **app control** (`docs/APP-CONTROL.md`): an optional, separate runner process starts, stops, restarts, updates and rolls back the Compose apps listed in a root-owned host registry. The UI and API only ever send `{app, action}` from a fixed action set; nothing typed in the browser reaches a command line. Control is off unless `SIGNAL_CONTROL_SOCKET` is set, mutations are refused through the public tunnel, and every action needs a same-origin request plus a password step-up. Without the runner SIGNAL looks and behaves exactly as before: the Apps view and its controls are not rendered.
+
+The Apps view reuses service-card anatomy and existing tokens; it introduces no colors. Destructive actions (stop, roll back) use the existing attention pair (`--red`, `--bad-bg`, `--bad-line`). Every action is confirmed in a dialog that states what will happen; update confirmation lists the commits to be deployed. Job logs reuse the container log surface (monospace, follow toggle, filtering).

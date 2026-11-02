@@ -43,6 +43,7 @@ CONTROL_ALLOW = [ipaddress.ip_network(item.strip(), strict=False) for item in
                  os.getenv('SIGNAL_CONTROL_ALLOW', '100.64.0.0/10,127.0.0.1/32,::1/128,fd7a:115c:a1e0::/48').split(',') if item.strip()]
 CONTROL_ACTIONS = ('start', 'stop', 'restart', 'check', 'update', 'rollback')
 CONTROL_GRANT_SECONDS = 600
+CONTROL_RATE_LIMIT = 20  # control requests per minute per client
 CONTROL_ATTEMPTS = {}
 CONTROL_RATE = {}
 CONTROL_CACHE = {}
@@ -500,7 +501,15 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         origin = self.headers.get('Origin')
         if origin and urlparse(origin).netloc != self.headers.get('Host'):
+            if re.fullmatch(r'/api/apps/[a-z0-9-]{1,40}/[a-z]+|/api/jobs/[a-f0-9]{32}/cancel', path) and CONTROL_SOCKET:
+                self.audit(path.split('/')[3][:40], path.rsplit('/', 1)[1][:12], 'refused', 'Cross-origin request.')
             return self.json(403, {'error': 'Request origin is not allowed.'})
+        match = re.fullmatch(r'/api/apps/([a-z0-9-]{1,40})/([a-z]+)', path)
+        if match and match[2] in CONTROL_ACTIONS:
+            return self.control_post(match[1], match[2])
+        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/cancel', path)
+        if match:
+            return self.control_post(None, 'cancel', match[1])
         if path == '/api/logout':
             self.cookie('', 0)
             return self.json(200, {'ok': True})
@@ -685,6 +694,86 @@ class Handler(BaseHTTPRequestHandler):
             mime = 'application/javascript'
         self.reply(200, file.read_bytes(), mime)
 
+    def client_key(self):
+        return 'tunnel:' + str(self.headers.get('Cf-Connecting-Ip', ''))[:64] if self.via_tunnel() else self.client_address[0]
+
+    def audit(self, name, action, outcome, detail):
+        """Every control request, allowed or refused, lands in the journal and the service log."""
+        event = {'time': time.time(), 'name': name, 'state': action, 'health': None, 'kind': 'control', 'outcome': outcome,
+                 'detail': detail, 'actor': self.client_key()}
+        print('Control:', outcome, action, name, 'from', event['actor'], '-', detail, flush=True)
+        monitor = getattr(self.server, 'monitor', None)
+        if monitor is not None and hasattr(monitor, 'events'):
+            with monitor.lock:
+                monitor.events.appendleft(event)
+
+    @staticmethod
+    def limited(table, key, limit, record=True):
+        now = time.time()
+        with AUTH_LOCK:
+            for item in list(table):
+                table[item] = [t for t in table[item] if now - t < 60]
+                if not table[item]:
+                    del table[item]
+            recent = table.get(key, [])
+            if len(recent) >= limit:
+                return True
+            if record:
+                table[key] = recent + [now]
+            return False
+
+    def control_post(self, app_id, action, job_id=None):
+        """Gate order: configured, rate, session, network, same-origin, registry, step-up. Only {app, action} reach the runner."""
+        if not CONTROL_SOCKET:
+            return self.json(404, {'error': 'Unknown endpoint.'})
+        name = app_id or job_id[:12]
+        def refuse(code, message, **extra):
+            self.audit(name, action, 'refused', message)
+            return self.json(code, {'error': message, **extra})
+        if self.limited(CONTROL_RATE, self.client_key(), CONTROL_RATE_LIMIT):
+            print('Control: rate limited', action, name, 'from', self.client_key(), flush=True)
+            return self.json(429, {'error': 'Too many control requests. Try again in a minute.'})
+        if not AUTH or not self.authenticated():
+            return refuse(401, 'A private session is required.')
+        if not self.control_network_allowed():
+            return refuse(403, 'App control is available over Tailscale or on the host, not through the public address.')
+        origin, fetch_site = self.headers.get('Origin') or '', self.headers.get('Sec-Fetch-Site') or ''
+        same_origin = urlparse(origin).netloc == self.headers.get('Host') if origin else fetch_site == 'same-origin'
+        if not same_origin or not (self.headers.get('Content-Type') or '').startswith('application/json'):
+            return refuse(403, 'Same-origin JSON request required.')
+        try:
+            body = self.request_json() if int(self.headers.get('Content-Length') or 0) else {}
+        except (ValueError, json.JSONDecodeError):
+            return self.json(400, {'error': 'Invalid request.'})
+        try:
+            if app_id is not None and app_id not in {app.get('id') for app in control_call({'op': 'list'})['apps']}:
+                return refuse(404, 'Unknown app.')
+            session = self.cookie_value('signal_session')
+            if action != 'check' and not valid_control_grant(self.cookie_value('signal_control'), session):
+                password = body.get('password')
+                if self.limited(CONTROL_ATTEMPTS, self.client_key(), 5, record=False):
+                    return refuse(429, 'Too many password attempts. Try again in a minute.')
+                if not isinstance(password, str) or not password:
+                    return refuse(403, 'Confirm with your access password.', stepUp=True)
+                digest = hashlib.pbkdf2_hmac('sha256', password[:1024].encode(), bytes.fromhex(AUTH['salt']), AUTH['iterations']).hex()
+                if not hmac.compare_digest(digest, AUTH['hash']):
+                    self.limited(CONTROL_ATTEMPTS, self.client_key(), 5)
+                    return refuse(403, 'Incorrect password.', stepUp=True)
+                with AUTH_LOCK:
+                    CONTROL_ATTEMPTS.pop(self.client_key(), None)
+                secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
+                self.cookie_header = 'signal_control=' + make_control_grant(session) + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + str(CONTROL_GRANT_SECONDS) + secure
+            if job_id:
+                result = control_call({'op': 'cancel', 'id': job_id})
+                self.audit(name, action, 'accepted', 'Cancel requested.')
+                return self.json(200, result)
+            result = control_call({'op': 'run', 'app': app_id, 'action': action, 'actor': 'session@' + self.client_key()})
+        except ControlError as exc:
+            code = {'not_found': 404, 'conflict': 409, 'unavailable': 503}.get(exc.code, 400)
+            return refuse(code, str(exc))
+        self.audit(name, action, 'accepted', 'Job ' + str(result['job'].get('id', ''))[:12] + ' queued.')
+        return self.json(202, result)
+
     def control_get(self, path, query):
         if not CONTROL_SOCKET:
             return self.json(404, {'error': 'Unknown endpoint.'})
@@ -695,6 +784,20 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.monitor.lock:
                     containers = list((self.server.monitor.snapshot or {}).get('containers', []))
                 return self.json(200, {'apps': join_apps(apps, containers), 'control': self.control_state(True)})
+            match = re.fullmatch(r'/api/apps/([a-z0-9-]{1,40})/jobs', path)
+            if match:
+                return self.json(200, control_call({'op': 'jobs', 'app': match[1], 'limit': 20}))
+            match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/log)?', path)
+            if match and match[2]:
+                if AUTH is None:
+                    return self.json(403, {'error': 'Job logs require a private session.'})
+                try:
+                    offset = max(0, int(query.get('offset', ['0'])[0]))
+                except ValueError:
+                    return self.json(400, {'error': 'Invalid offset.'})
+                return self.json(200, control_call({'op': 'log', 'id': match[1], 'offset': offset}))
+            if match:
+                return self.json(200, control_call({'op': 'job', 'id': match[1]}))
             return self.json(404, {'error': 'Unknown endpoint.'})
         except ControlError as exc:
             if exc.code == 'unavailable':
