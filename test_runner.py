@@ -349,6 +349,16 @@ class LifecycleTests(RunnerCase):
         self.assertEqual(again.store.job(ids[-1])['status'], 'failed')
         self.assertIn('interrupted', again.store.job(ids[-1])['message'])
 
+    def test_summary_reports_last_deploy_ignoring_checks(self):
+        fixture = Fixture(self.root)
+        fixture.configure(fail={'restart': 1})
+        item = self.make_runner(fixture)
+        failed = wait(item, item.submit('demo', 'restart', 't')['id'])
+        wait(item, item.submit('demo', 'check', 't')['id'])
+        summary = item.summary('demo')
+        self.assertEqual(summary['lastJob']['action'], 'check')
+        self.assertEqual((summary['lastDeploy']['id'], summary['lastDeploy']['status']), (failed['id'], 'failed'))
+
     def test_check_job_logs_result(self):
         fixture = Fixture(self.root)
         fixture.push('second')

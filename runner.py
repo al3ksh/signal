@@ -195,6 +195,10 @@ class JobStore:
             query = "SELECT * FROM jobs WHERE app=? AND action='update'" + (' AND status=? AND prev_commit IS NOT NULL' if status else '') + ' ORDER BY created DESC LIMIT 1'
             return self.db.execute(query, (app, status) if status else (app,)).fetchone()
 
+    def last_deploy(self, app):
+        with self.lock:
+            return public_job(self.db.execute("SELECT * FROM jobs WHERE app=? AND action != 'check' ORDER BY created DESC LIMIT 1", (app,)).fetchone())
+
     def jobs(self, app, limit=20):
         with self.lock:
             return [public_job(r) for r in self.db.execute('SELECT * FROM jobs WHERE app=? ORDER BY created DESC LIMIT ?', (app, limit))]
@@ -802,7 +806,8 @@ class Runner:
         rollback = self.store.last_update(app_id, 'succeeded') if app['repo'] else None
         return {'rollbackTo': rollback['prev_commit'][:7] if rollback else None,'id': app_id, 'name': app['name'], 'hasRepo': bool(app['repo']), 'mode': app['mode'],
                 'branch': app['repo']['branch'] if app['repo'] else None, 'hasHealthUrl': bool(app['health'] and app['health']['url']),
-                'git': self.store.check(app_id) if app['repo'] else None, 'lastJob': jobs[0] if jobs else None, 'activeJob': active_job}
+                'git': self.store.check(app_id) if app['repo'] else None, 'lastJob': jobs[0] if jobs else None, 'activeJob': active_job,
+                'lastDeploy': self.store.last_deploy(app_id)}
 
     def job_id(self, request):
         job_id = request.get('id')

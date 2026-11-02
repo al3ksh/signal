@@ -109,6 +109,8 @@ All commands run with `cwd` set to the app directory and `docker compose --proje
 
 **Health** passes when every project container is running and not `unhealthy`/`starting` (exited containers with exit code 0 count as finished one-shot services), and, if configured, the health URL answers the expected status. It is polled every 2 s until `timeoutSeconds`.
 
+**Incidents:** a failed job opens a critical incident and a rolled-back one a warning in **Alerts & events** (`deploy:<app>`), so an automatic rollback is never silent. The next successful job for that app resolves it; a Services maintenance window for the app suppresses it.
+
 **Recovery after a restart:** a deploy interrupted after the checkout moved is rolled back automatically when the runner starts again (see Troubleshooting).
 
 **Automatic rollback:** if anything fails after the checkout moved — build, pull, `up`, health, or you press **Cancel** — the runner resets to the exact previous commit, restores the saved images (or rebuilds when none were saved), runs `up -d` and checks health again. The job ends as `rolled back` with the reason, or `failed` if the rollback itself failed (the log says why). Untracked files (`.env`, data folders) are never touched.

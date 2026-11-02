@@ -19,6 +19,7 @@ History starts at installation. Container logs and per-container CPU/RAM history
 | RAM usage at least 90% | 60 seconds | Below 85% |
 | System disk usage at least 90% | 60 seconds | Below 87% |
 | Configured HTTP endpoint returns an error or cannot connect | 30 seconds | Successful HTTP 2xx/3xx response |
+| App control only: an app's last start/stop/restart/update/rollback job failed (critical) or was rolled back (warning) | Within 30 seconds of the job ending | The next job for that app succeeds; also suppressed by the app's maintenance window |
 
 Detection is sampled, so opening can be delayed by one sample interval. An unavailable temperature does not create an alarm or falsely resolve an existing one. During a Docker outage, existing container incidents remain unchanged; an unreadable inventory does not mean every container disappeared.
 
