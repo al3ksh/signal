@@ -16,13 +16,17 @@ class Store:
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS samples (
               time INTEGER PRIMARY KEY, n INTEGER, cpu REAL, memory REAL,
-              temperature REAL, temp_n INTEGER, rx REAL, tx REAL);
+              temperature REAL, temp_n INTEGER, rx REAL, tx REAL, disk REAL DEFAULT 0, disk_n INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS alerts (
               id INTEGER PRIMARY KEY, key TEXT, severity TEXT, title TEXT,
               message TEXT, opened REAL, resolved REAL, acknowledged REAL);
             CREATE UNIQUE INDEX IF NOT EXISTS active_alert ON alerts(key) WHERE resolved IS NULL;
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
         ''')
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(samples)')}
+        for column, kind in (('disk', 'REAL DEFAULT 0'), ('disk_n', 'INTEGER DEFAULT 0')):
+            if column not in columns:  # databases from before disk history; old rows simply have no disk value
+                self.db.execute(f'ALTER TABLE samples ADD COLUMN {column} {kind}')
         self.pending = {}
         self.retention = retention_days * 86400
         self.last_flush = time.monotonic()
@@ -30,7 +34,7 @@ class Store:
     def add(self, point):
         with self.lock:
             minute = int(point['time'] // 60) * 60
-            row = self.pending.setdefault(minute, [minute, 0, 0., 0., 0., 0, 0., 0.])
+            row = self.pending.setdefault(minute, [minute, 0, 0., 0., 0., 0, 0., 0., 0., 0])
             row[1] += 1
             row[2] += point['cpu']
             row[3] += point['memory']
@@ -39,15 +43,19 @@ class Store:
                 row[5] += 1
             row[6] += point['rx']
             row[7] += point['tx']
+            if point.get('disk') is not None:
+                row[8] += point['disk']
+                row[9] += 1
             if time.monotonic() - self.last_flush >= 30:
                 self.flush(point['time'])
 
     def flush(self, now=None):
         with self.lock, self.db:
-            self.db.executemany('''INSERT INTO samples VALUES (?,?,?,?,?,?,?,?)
+            self.db.executemany('''INSERT INTO samples(time,n,cpu,memory,temperature,temp_n,rx,tx,disk,disk_n) VALUES (?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(time) DO UPDATE SET n=n+excluded.n, cpu=cpu+excluded.cpu,
                 memory=memory+excluded.memory, temperature=temperature+excluded.temperature,
-                temp_n=temp_n+excluded.temp_n, rx=rx+excluded.rx, tx=tx+excluded.tx''', self.pending.values())
+                temp_n=temp_n+excluded.temp_n, rx=rx+excluded.rx, tx=tx+excluded.tx,
+                disk=COALESCE(disk,0)+excluded.disk, disk_n=COALESCE(disk_n,0)+excluded.disk_n''', self.pending.values())
             self.pending.clear()
             cutoff = (now if now is not None else time.time()) - self.retention
             self.db.execute('DELETE FROM samples WHERE time < ?', (cutoff,))
@@ -58,7 +66,8 @@ class Store:
         now = time.time() if now is None else now
         step = 600 if seconds > 86400 else 60
         with self.lock:
-            rows = {r['time']: list(r) for r in self.db.execute('SELECT * FROM samples WHERE time >= ? ORDER BY time', (now-seconds,))}
+            rows = {r['time']: [v or 0 for v in r] for r in self.db.execute(
+                'SELECT time,n,cpu,memory,temperature,temp_n,rx,tx,disk,disk_n FROM samples WHERE time >= ? ORDER BY time', (now-seconds,))}
             for minute, row in self.pending.items():
                 if minute >= now-seconds:
                     if minute in rows:
@@ -68,14 +77,14 @@ class Store:
             buckets = {}
             for row in rows.values():
                 bucket = row[0] // step * step
-                total = buckets.setdefault(bucket, [0] * 7)
+                total = buckets.setdefault(bucket, [0] * 9)
                 for i, value in enumerate(row[1:]):
                     total[i] += value
             points = []
             previous = None
-            for bucket, (n, cpu, memory, temp, tn, rx, tx) in sorted(buckets.items()):
+            for bucket, (n, cpu, memory, temp, tn, rx, tx, disk, dn) in sorted(buckets.items()):
                 points.append(dict(time=bucket, cpu=cpu/n, memory=memory/n, temperature=temp/tn if tn else None,
-                                   rx=rx/n, tx=tx/n, gap=previous is not None and bucket-previous > step*1.5))
+                                   rx=rx/n, tx=tx/n, disk=disk/dn if dn else None, gap=previous is not None and bucket-previous > step*1.5))
                 previous = bucket
             return {'points': points, 'step': step, 'retentionDays': self.retention // 86400}
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added Raspberry Pi health: all `get_throttled` bits decoded (now and since boot) with core voltage, SD card ext4 errors and writes per day, read-only root detection, inodes, NTP sync, zram/swap/major faults (PSI when available), failed systemd units and a 7-day "disk full in N days" forecast. Shown in an overview card and on the temperature card, with incidents for under-voltage, power history, SD errors, read-only root, clock, failed units and the disk forecast. Disk use is now part of the history.
+
 - Added `deploy/deploy.py`, a stdlib deploy script that needs only ssh (works from Windows Git Bash): it ships only what changed, restarts only the affected unit, verifies `/healthz`, the served assets and unit state, rolls back by itself, keeps five `releases/<stamp>/` snapshots, supports `--dry-run`, `--list`, `--rollback` and `--prune-legacy`, and refuses to start if sudo would prompt. `update-signal.sh` is now a wrapper around it.
 
 - Added an optional app registry and a separate runner (`runner.py`) that reports each Compose app's deployed commit and how many commits it is behind its repository branch. A new Apps view appears only when `SIGNAL_CONTROL_SOCKET` is set and the runner is reachable.

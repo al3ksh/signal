@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SIGNAL_DATA_DIR=/data
 RUN groupadd --gid 10001 signal && useradd --uid 10001 --gid signal --no-create-home signal \
     && mkdir /data && chown signal:signal /data
 WORKDIR /app
-COPY server.py storage.py alerts.py setup_access.py setup_2fa.py ./
+COPY server.py storage.py alerts.py health.py setup_access.py setup_2fa.py ./
 COPY --from=frontend /build/dist ./dist
 USER 10001:10001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \

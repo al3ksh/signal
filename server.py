@@ -14,13 +14,13 @@ import shutil
 import socket
 import secrets
 import struct
-import subprocess
 import threading
 import time
 import signal
 import uuid
 from storage import Store
 from alerts import AlertEngine
+from health import Health
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
@@ -33,6 +33,7 @@ INTERVAL = max(3, int(os.getenv('SIGNAL_INTERVAL', '5')))
 DATA_DIR = Path(os.getenv('SIGNAL_DATA_DIR', str(ROOT / 'data')))
 PROC_ROOT = Path(os.getenv('SIGNAL_PROC_ROOT', '/proc'))
 SYS_ROOT = Path(os.getenv('SIGNAL_SYS_ROOT', '/sys'))
+RUN_ROOT = Path(os.getenv('SIGNAL_RUN_ROOT', '/run'))
 AUTH_FILE = Path(os.getenv('SIGNAL_AUTH_FILE', str(DATA_DIR / 'access.json')))
 AUTH = json.loads(AUTH_FILE.read_text()) if AUTH_FILE.exists() else None
 PUBLIC_MODE = os.getenv('SIGNAL_PUBLIC_MODE') == '1'
@@ -293,6 +294,7 @@ class Monitor:
         self.check_results = {}
         self.last_check_time = 0
         self.boot_at = time.time()
+        self.health = Health(self.store, PROC_ROOT, SYS_ROOT, RUN_ROOT, os.getenv('SIGNAL_DISK_PATH', '/'))
         self.last_deploy_check = 0
 
     @staticmethod
@@ -443,12 +445,8 @@ class Monitor:
                     self.events.appendleft({'time': now, 'name': old[0], 'state': 'removed', 'health': None, 'kind': 'changed'})
             self.previous_states = current_states
             self.container_ticks = {k: v for k, v in self.container_ticks.items() if k[:12] in current_states}
-        throttle = None
-        try:
-            raw_throttle = subprocess.run(['vcgencmd', 'get_throttled'], capture_output=True, text=True, timeout=2, check=False).stdout.strip()
-            throttle = int(raw_throttle.split('=')[1], 16)
-        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-            pass
+        health = self.health.sample(now)  # slow readers are cached by the health thread
+        throttle = int(health['power']['raw'], 16) if health['power'] else None
         configured_checks = self.configured_checks(containers)
         if configured_checks and (not self.check_results or now-self.last_check_time >= 15):
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -459,9 +457,11 @@ class Monitor:
         self.check_results = {key: value for key, value in self.check_results.items() if key in check_ids}
         checks = [self.check_results.get(item['id'], {**item, 'ok': None, 'status': None, 'latency': None, 'checkedAt': None, 'message': 'Waiting for the first check'}) for item in configured_checks]
         data = {'timestamp': now, 'interval': INTERVAL, 'host': {'name': os.getenv('SIGNAL_NODE_NAME') or read('/proc/sys/kernel/hostname', socket.gethostname()), 'alias': os.getenv('SIGNAL_NODE_NAME') or read('/proc/sys/kernel/hostname', socket.gethostname()), 'model': read('/proc/device-tree/model').replace('\0', '') or read('/sys/class/dmi/id/product_name', 'Linux host'), 'kernel': os.uname().release, 'arch': os.uname().machine, 'uptime': float(read('/proc/uptime', '0').split()[0]), 'cpu': usage[0] if usage else 0, 'cores': usage[1:], 'frequency': int(freq)/1000 if freq else None, 'load': os.getloadavg(), 'temperature': temp, 'throttle': throttle, 'memory': {'total': memory['MemTotal'], 'used': memory['MemTotal']-memory['MemAvailable'], 'available': memory['MemAvailable'], 'cache': memory.get('Cached', 0), 'swapTotal': memory.get('SwapTotal', 0), 'swapUsed': memory.get('SwapTotal', 0)-memory.get('SwapFree', 0)}, 'disk': {'total': disk.total, 'used': disk.used, 'free': disk.free}, 'network': interfaces}, 'containers': sorted(containers, key=lambda c: (c['state'] == 'running' and c['health'] != 'unhealthy', c['name'])), 'checks': checks, 'dockerVersion': docker_version, 'processes': self.process_sample(elapsed), 'errors': errors, 'startedAt': self.boot_at}
-        point = {'time': now, 'cpu': data['host']['cpu'], 'memory': data['host']['memory']['used']/memory['MemTotal']*100, 'temperature': data['host']['temperature'], 'rx': sum(i['rx'] for i in interfaces), 'tx': sum(i['tx'] for i in interfaces)}
+        data['health'] = health
+        point = {'time': now, 'cpu': data['host']['cpu'], 'memory': data['host']['memory']['used']/memory['MemTotal']*100, 'temperature': data['host']['temperature'], 'rx': sum(i['rx'] for i in interfaces), 'tx': sum(i['tx'] for i in interfaces), 'disk': disk.used/max(1, disk.total)*100}
         self.store.add(point)
         self.alert_engine.evaluate(data)
+        self.alert_engine.evaluate_health(health, now)
         self.deploy_alerts(now)
         data['alerts'] = self.store.alerts()
         with self.lock:
@@ -483,6 +483,7 @@ class Monitor:
         self.alert_engine.evaluate_deploys(apps, now)
 
     def run(self):
+        self.health.start(self.stop)
         while not self.stop.is_set():
             begin = time.monotonic()
             try:

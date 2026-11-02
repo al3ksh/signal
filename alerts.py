@@ -99,6 +99,48 @@ class AlertEngine:
                 self.store.resolve_alert(key, now)
                 self.active.remove(key)
 
+    def evaluate_health(self, health, now):
+        """Pi health incidents. None means unknown and never resolves or opens anything."""
+        with self.lock:
+            power = health.get('power')
+            self.check('power:undervoltage', None if power is None else 'under-voltage' in power['now'], 'Under-voltage right now',
+                       'The supply is below 4.63 V. Expect throttling, SD card corruption or crashes. Check the power supply and cable.',
+                       now, delay=0, severity='critical')
+            since = power and power['sinceBoot']
+            # Sticky since-boot bits only clear on reboot, so this opens once per boot and resolves after one.
+            self.check('power:history', None if power is None else bool(since), 'Power or heat limits hit since boot',
+                       f"Since boot: {', '.join(since or [])}. The PSU or cable may be too weak.", now, delay=0)
+            self.check('sd:errors', self.sd_errors(health.get('sd'), now), 'SD card filesystem errors',
+                       f"{(health.get('sd') or {}).get('errors')} ext4 errors on {(health.get('sd') or {}).get('device')}. Back up now and check the card.",
+                       now, delay=0, severity='critical')
+            self.check('fs:readonly', health.get('rootReadOnly'), 'Root filesystem is read-only',
+                       'The kernel remounted / read-only, usually because the SD card is failing. Nothing new can be written.',
+                       now, delay=0, severity='critical')
+            synced = health.get('clockSynced')
+            self.check('clock:unsynced', None if synced is None else not synced, 'Clock is not synchronized',
+                       'NTP has not synced for 10 minutes. Authenticator codes may be rejected until it does.', now, delay=600)
+            units = health.get('failedUnits')
+            self.check('units:failed', None if units is None else bool(units), 'Failed systemd units',
+                       'Failed: ' + ', '.join((units or [])[:8]) + '.', now, delay=0)
+            forecast = health.get('diskForecast')
+            limit = 21 if 'disk:forecast' in self.active else 14
+            self.check('disk:forecast', bool(forecast and forecast['days'] < limit), 'Disk is filling up',
+                       f"At the current rate the system disk is full in about {forecast['days'] if forecast else '?'} days.", now, delay=0)
+
+    def sd_errors(self, sd, now):
+        """True while the ext4 error count rose within the last 7 days (first sight uses last_error_time)."""
+        if not sd or sd.get('errors') is None:
+            return None
+        seen = self.store.metadata('sdErrors')
+        count = sd['errors']
+        if seen is None or count < seen['count']:
+            seen = {'count': count, 'changedAt': sd.get('lastErrorTime') if count else None}
+            self.store.set_metadata('sdErrors', seen)
+        elif count > seen['count']:
+            seen = {'count': count, 'changedAt': now}
+            self.store.set_metadata('sdErrors', seen)
+        return bool(seen['changedAt'] and now - seen['changedAt'] < 7 * 86400)
+
     def evaluate_deploys(self, apps, now):
         """App-control jobs: the last non-check job of each app failing or rolling back is an incident;
         the next successful one resolves it. Running jobs and an unreachable runner change nothing."""
