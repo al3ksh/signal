@@ -35,6 +35,7 @@ LOG_CAP = 2 * 1024 * 1024
 KEEP_JOBS = 200
 JOB_ID = re.compile(r'[a-f0-9]{32}')
 IMAGE_REF = re.compile(r'[a-z0-9][a-z0-9._/:-]{0,250}')
+SERVICE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,62}')
 
 
 class RegistryError(ValueError):
@@ -501,7 +502,50 @@ class Runner:
             ok = self.step(handle, app, ['docker', 'image', 'tag', backup, image], 60, check=False, cancellable=False)[0] == 0 and ok
         return ok
 
-    def build(self, handle, app, commit, cancellable=True):
+    def changed_services(self, handle, app, prev, new):
+        """Services whose build context or Dockerfile changed between prev and new; None means build everything."""
+        diff = self.jgit(handle, app, 'diff', '--name-only', prev, new, check=False)
+        top = self.jgit(handle, app, 'rev-parse', '--show-toplevel', check=False)
+        if diff is None or not top:
+            return None
+        top = Path(top).resolve()
+        changed = [line for line in diff.splitlines() if line]
+        relative = lambda path: str(path.relative_to(top)) if path.is_relative_to(top) else None
+        if any(relative(Path(f)) in changed for f in app['composeFiles']):
+            self.write(handle, '# a Compose file changed; building every service\n')
+            return None
+        # Not logged: the rendered config contains interpolated .env values.
+        code, out, _ = self.quiet(app, self.compose(app, 'config', '--format', 'json'), 60, env=self.commit_env(new))
+        try:
+            services = json.loads(out)['services'] if code == 0 else None
+            assert isinstance(services, dict)
+        except (ValueError, KeyError, TypeError, AssertionError):
+            return None
+        selected, buildable = [], 0
+        for name, config in services.items():
+            build = config.get('build') if isinstance(config, dict) else None
+            if not build:
+                continue
+            if not SERVICE.fullmatch(name):
+                return None
+            buildable += 1
+            build = {'context': build} if isinstance(build, str) else build
+            context = str(build.get('context') or '.')
+            if '://' in context or context.startswith('git@'):
+                selected.append(name)
+                continue
+            context = Path(context if os.path.isabs(context) else os.path.join(app['dir'], context)).resolve()
+            dockerfile = str(build.get('dockerfile') or 'Dockerfile')
+            dockerfile = Path(dockerfile if os.path.isabs(dockerfile) else context / dockerfile).resolve()
+            ctx, df = relative(context), relative(dockerfile)
+            if ctx is None or df is None or any(path == df or ctx == '.' or path.startswith(ctx + '/') for path in changed):
+                selected.append(name)
+        if not buildable:
+            return None
+        self.write(handle, f"# build contexts changed: {', '.join(selected) or 'none'}\n")
+        return selected
+
+    def build(self, handle, app, commit, cancellable=True, services=None):
         """Build on the host or pull CI images, one at a time across all apps."""
         if not self.build_slot.acquire(blocking=False):
             self.write(handle, '# waiting for another build to finish\n')
@@ -509,7 +553,7 @@ class Runner:
                 if cancellable and handle['cancelled'].is_set():
                     raise JobCancelled()
         try:
-            args = ('pull',) if app['mode'] == 'pull' else ('build', '--pull')
+            args = ('pull',) if app['mode'] == 'pull' else ('build', '--pull', *(services or ()))
             self.step(handle, app, self.compose(app, *args), self.timeouts['build'], env=self.commit_env(commit), cancellable=cancellable)
         finally:
             self.build_slot.release()
@@ -609,7 +653,11 @@ class Runner:
             return f'Already up to date with {upstream} at {prev[:7]}.'
         def artifacts(commit):
             self.phase(handle, 'pull' if app['mode'] == 'pull' else 'build')
-            self.build(handle, app, commit)
+            services = self.changed_services(handle, app, prev, commit) if app['mode'] == 'build' else None
+            if services == []:
+                self.write(handle, '# no build context changed; skipping the build\n')
+                return
+            self.build(handle, app, commit, services=services)
         new = self.deploy(handle, app, prev, lambda: self.jgit(handle, app, 'merge', '--ff-only', upstream), artifacts)
         return f'Deployed {new[:7]} (was {prev[:7]}).'
 
